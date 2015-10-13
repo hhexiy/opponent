@@ -1,0 +1,416 @@
+
+--[[
+
+This file trains a character-level multi-layer RNN on text data
+
+Code is based on implementation in 
+https://github.com/oxford-cs-ml-2015/practical6
+but modified to have multi-layer support, GPU support, as well as
+many other common model/optimization bells and whistles.
+The practical6 code is in turn based on 
+https://github.com/wojciechz/learning_to_execute
+which is turn based on other stuff in Torch, etc... (long lineage)
+
+]]--
+
+require 'torch'
+require 'nn'
+require 'util.mynngraph'
+require 'optim'
+require 'lfs'
+
+require 'util.OneHot'
+require 'util.misc'
+local QBMinibatchLoader = require 'util.QBMinibatchLoader'
+local model_utils = require 'util.model_utils'
+local LSTM = require 'model.LSTM'
+local GRU = require 'model.GRU'
+local RNN = require 'model.RNN'
+
+torch.setheaptracking(true)
+
+cmd = torch.CmdLine()
+cmd:text()
+cmd:text('Train a question-answering model')
+cmd:text()
+cmd:text('Options')
+-- data
+cmd:option('-data_dir','dat/qb','data directory. Should contain the file input.txt with input data')
+cmd:option('-input_file','input.txt','data file name')
+-- model params
+cmd:option('-rnn_size', 128, 'size of LSTM internal state')
+cmd:option('-num_layers', 1, 'number of layers in the LSTM')
+cmd:option('-model', 'lstm', 'lstm,gru or rnn')
+cmd:option('-embedding', 'dat/glove', 'directory of pretrained word embeddings')
+-- optimization
+cmd:option('-learning_rate',2e-3,'learning rate')
+cmd:option('-learning_rate_decay',0.97,'learning rate decay')
+cmd:option('-learning_rate_decay_after',10,'in number of epochs, when to start decaying the learning rate')
+cmd:option('-decay_rate',0.95,'decay rate for rmsprop')
+cmd:option('-dropout',0,'dropout for regularization, used after each RNN hidden layer. 0 = no dropout')
+cmd:option('-seq_length',50,'number of timesteps to unroll for')
+cmd:option('-batch_size',50,'number of sequences to train on in parallel')
+cmd:option('-max_epochs',50,'number of full passes through the training data')
+cmd:option('-grad_clip',5,'clip gradients at this value')
+cmd:option('-train_frac',0.95,'fraction of data that goes into train set')
+cmd:option('-val_frac',0.05,'fraction of data that goes into validation set')
+            -- test_frac will be computed as (1 - train_frac - val_frac)
+cmd:option('-init_from', '', 'initialize network parameters from checkpoint at this path')
+-- bookkeeping
+cmd:option('-seed',123,'torch manual random number generator seed')
+cmd:option('-print_every',1,'how many steps/minibatches between printing out the loss')
+cmd:option('-eval_val_every',0,'every how many iterations should we evaluate on validation data?')
+cmd:option('-checkpoint_dir', '/fs/clip-scratch/hhe/opponent/cv', 'output directory where checkpoints get written')
+cmd:option('-savefile','lstm','filename to autosave the checkpont to. Will be inside checkpoint_dir/')
+-- GPU/CPU
+cmd:option('-gpuid',0,'which gpu to use. -1 = use CPU')
+cmd:option('-opencl',0,'use OpenCL (instead of CUDA)')
+-- debug
+cmd:option('-debug',0,'debug mode: printouts and assertions')
+cmd:text()
+
+-- parse input params
+opt = cmd:parse(arg)
+torch.manualSeed(opt.seed)
+
+-- initialize cunn/cutorch for training on the GPU and fall back to CPU gracefully
+if opt.gpuid >= 0 and opt.opencl == 0 then
+    local ok, cunn = pcall(require, 'cunn')
+    local ok2, cutorch = pcall(require, 'cutorch')
+    if not ok then print('package cunn not found!') end
+    if not ok2 then print('package cutorch not found!') end
+    if ok and ok2 then
+        print('using CUDA on GPU ' .. opt.gpuid .. '...')
+        cutorch.setDevice(opt.gpuid + 1) -- note +1 to make it 0 indexed! sigh lua
+        cutorch.manualSeed(opt.seed)
+    else
+        print('If cutorch and cunn are installed, your CUDA toolkit may be improperly configured.')
+        print('Check your CUDA toolkit installation, rebuild cutorch and cunn, and try again.')
+        print('Falling back on CPU mode')
+        opt.gpuid = -1 -- overwrite user setting
+    end
+end
+
+-- initialize clnn/cltorch for training on the GPU and fall back to CPU gracefully
+if opt.gpuid >= 0 and opt.opencl == 1 then
+    local ok, cunn = pcall(require, 'clnn')
+    local ok2, cutorch = pcall(require, 'cltorch')
+    if not ok then print('package clnn not found!') end
+    if not ok2 then print('package cltorch not found!') end
+    if ok and ok2 then
+        print('using OpenCL on GPU ' .. opt.gpuid .. '...')
+        cltorch.setDevice(opt.gpuid + 1) -- note +1 to make it 0 indexed! sigh lua
+        torch.manualSeed(opt.seed)
+    else
+        print('If cltorch and clnn are installed, your OpenCL driver may be improperly configured.')
+        print('Check your OpenCL driver installation, check output of clinfo command, and try again.')
+        print('Falling back on CPU mode')
+        opt.gpuid = -1 -- overwrite user setting
+    end
+end
+
+-- create the data loader class
+local loader = QBMinibatchLoader.create(opt.data_dir, opt.input_file, opt.batch_size)
+local vocab_size = loader.vocab_size  
+local vocab = loader.vocab_mapping
+
+-- word embedding
+local emb = nil
+local emb_size = nil
+if string.len(opt.embedding) > 0 then
+    emb = loader:load_embedding(opt.embedding)
+    emb_size = emb.weight[1]:size(1)
+else
+    emb = nn.LookupTable(vocab_size, opt.rnn_size) 
+    emb_size = opt.rnn_size
+end
+print('word embedding size: ' .. emb_size)
+
+-- predict answer at each input word
+local output_size = loader.ans_size
+
+-- make sure output directory exists
+if not path.exists(opt.checkpoint_dir) then lfs.mkdir(opt.checkpoint_dir) end
+
+-- define the model: prototypes for one timestep, then clone them in time
+local do_random_init = true
+if string.len(opt.init_from) > 0 then
+    print('loading an LSTM from checkpoint ' .. opt.init_from)
+    local checkpoint = torch.load(opt.init_from)
+    protos = checkpoint.protos
+    -- make sure the vocabs are the same
+    local vocab_compatible = true
+    for c,i in pairs(checkpoint.vocab) do 
+        if not vocab[c] == i then 
+            vocab_compatible = false
+        end
+    end
+    assert(vocab_compatible, 'error, the character vocabulary for this dataset and the one in the saved checkpoint are not the same. This is trouble.')
+    -- overwrite model settings based on checkpoint to ensure compatibility
+    print('overwriting rnn_size=' .. checkpoint.opt.rnn_size .. ', num_layers=' .. checkpoint.opt.num_layers .. ' based on the checkpoint.')
+    opt.rnn_size = checkpoint.opt.rnn_size
+    opt.num_layers = checkpoint.opt.num_layers
+    do_random_init = false
+else
+    print('creating an ' .. opt.model .. ' with ' .. opt.num_layers .. ' layers')
+    protos = {}
+    if opt.model == 'lstm' then
+        protos.rnn = LSTM.lstm(emb, output_size, opt.rnn_size, opt.num_layers, opt.dropout)
+    -- TODO: fix rnn and gru
+    elseif opt.model == 'gru' then
+        protos.rnn = GRU.gru(vocab_size, output_size, opt.rnn_size, opt.num_layers, opt.dropout)
+    elseif opt.model == 'rnn' then
+        protos.rnn = RNN.rnn(vocab_size, output_size, opt.rnn_size, opt.num_layers, opt.dropout)
+    end
+    protos.criterion = nn.ClassNLLCriterion()
+end
+
+-- the initial state of the cell/hidden states
+init_state = {} 
+for L=1,opt.num_layers do
+    local h_init = torch.zeros(opt.batch_size, opt.rnn_size)
+    if opt.gpuid >=0 and opt.opencl == 0 then h_init = h_init:cuda() end
+    if opt.gpuid >=0 and opt.opencl == 1 then h_init = h_init:cl() end
+    table.insert(init_state, h_init:clone())
+    if opt.model == 'lstm' then
+        table.insert(init_state, h_init:clone())
+    end
+end
+
+-- ship the model to the GPU if desired
+if opt.gpuid >= 0 and opt.opencl == 0 then
+    for k,v in pairs(protos) do v:cuda() end
+end
+if opt.gpuid >= 0 and opt.opencl == 1 then
+    for k,v in pairs(protos) do v:cl() end
+end
+
+-- put the above things into one flattened parameters tensor
+params, grad_params = model_utils.combine_all_parameters(protos.rnn)
+print('number of parameters in the model: ' .. params:nElement())
+
+-- initialization
+if do_random_init then
+    params:uniform(-0.08, 0.08) -- small numbers uniform
+end
+
+-- make a bunch of clones after flattening, as that reallocates memory
+clones = {}
+print('cloning ' .. loader.max_seq_length .. ' rnn units...')
+for name,proto in pairs(protos) do
+    clones[name] = model_utils.clone_many_times(proto, loader.max_seq_length, not proto.parameters)
+end
+print('done')
+
+-- compute accuracy
+function accuracy(pred, gold, mask)
+    -- isSameSizeAs require same type too!
+    assert(pred:isSameSizeAs(gold) and gold:isSize(mask:size()), 'dimension mismatch')
+    local correct = pred:maskedSelect(mask):eq(gold:maskedSelect(mask))
+    return correct:sum() / correct:size(1) 
+end
+
+--TODO
+function seq_accuracy(pred, gold, mask)
+end
+
+-- predict the majority class
+function constant_baseline(gold, mask)
+    local correct  = gold:maskedSelect(mask):eq(loader.sorted_ans[1])
+    return correct:sum() / correct:size(1) 
+end
+
+-- predict the average buzz position
+function average_baseline(gold, mask)
+    average_buzz_pos = math.ceil((gold:eq(1):sum() / gold:size(1)) + 1)
+    print('average buzz pos:' .. average_buzz_pos)
+    pred = torch.Tensor(gold:size()):fill(2)
+    pred:narrow(2, 1, average_buzz_pos):fill(1)
+    return accuracy(pred, gold, mask)
+end
+
+-- get next batch
+function get_next_batch(split_index)
+    -- fetch a batch
+    local x, y, m = loader:next_batch(split_index)
+    if opt.gpuid >= 0 and opt.opencl == 0 then -- ship the input arrays to GPU
+        -- have to convert to float because integers can't be cuda()'d
+        x = x:float():cuda()
+        y = y:float():cuda()
+    end
+    if opt.gpuid >= 0 and opt.opencl == 1 then -- ship the input arrays to GPU
+        x = x:cl()
+        y = y:cl()
+    end
+    return x, y, m
+end
+
+-- evaluate the loss over an entire split
+function eval_split(split_index, max_batches)
+    print('evaluating loss over split index ' .. split_index)
+    local n = loader.split_sizes[split_index]
+    if max_batches ~= nil then n = math.min(max_batches, n) end
+
+    loader:reset_batch_pointer(split_index) -- move batch iteration pointer for this split to front
+    local loss = 0
+    local acc = 0
+    local prediction = nil
+    local rnn_state = {[0] = init_state}
+    local pred = torch.IntTensor(n*opt.batch_size, loader.max_seq_length)
+    local gold = torch.IntTensor(n*opt.batch_size, loader.max_seq_length)
+    local mask = torch.ByteTensor(n*opt.batch_size, loader.max_seq_length):fill(0)
+    local total_length = 0 -- sum of seq length of each batch
+    
+    for i = 1,n do -- iterate over batches in the split
+        -- fetch a batch
+        local x, y, m = get_next_batch(split_index)
+        -- seq_length is different for each batch (max length in *this* batch)
+        local seq_length = x:size(2)
+        total_length = total_length + seq_length
+        -- starting id of this batch
+        local from = (i-1)*opt.batch_size + 1
+        local to = from+opt.batch_size-1
+        gold:sub(from, to, 1, seq_length):copy(y)
+        mask:sub(from, to, 1, seq_length):copy(m)
+
+        -- forward pass
+        for t=1,seq_length do
+            clones.rnn[t]:evaluate() -- for dropout proper functioning
+            local lst = clones.rnn[t]:forward{x[{{}, t}], unpack(rnn_state[t-1])}
+            rnn_state[t] = {}
+            for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end
+            prediction = lst[#lst] 
+            loss = loss + clones.criterion[t]:forward(prediction, y[{{}, t}])
+            -- TODO: record all probs in output 
+            _, p = torch.max(prediction, 2)
+            pred:sub(from, to, t, t):copy(p)
+        end
+        --print(i .. '/' .. n .. '...')
+    end
+
+    acc = accuracy(pred, gold, mask)
+    const_baseline = constant_baseline(gold, mask, output_size)
+    loss = loss / total_length
+    print(string.format('loss = %.8f, acc = %.4f, const baseline = %.4f', loss, acc, const_baseline))
+    return loss
+end
+
+-- do fwd/bwd and return loss, grad_params
+local init_state_global = clone_list(init_state)
+function feval(x)
+    if x ~= params then
+        params:copy(x)
+    end
+    grad_params:zero()
+
+    ------------------ get minibatch -------------------
+    local x, y = get_next_batch(1) -- discard mask
+    local seq_length = x:size(2)
+    ------------------- forward pass -------------------
+    local rnn_state = {[0] = init_state_global}
+    local predictions = {}           -- softmax outputs
+    local loss = 0
+    for t=1,seq_length do
+        clones.rnn[t]:training() -- make sure we are in correct mode (this is cheap, sets flag)
+        local lst = clones.rnn[t]:forward{x[{{}, t}], unpack(rnn_state[t-1])}
+        rnn_state[t] = {}
+        for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end -- extract the state, without output
+        predictions[t] = lst[#lst] -- last element is the prediction
+        --print(predictions[t], y[{{}, t}])
+        loss = loss + clones.criterion[t]:forward(predictions[t], y[{{}, t}])
+    end
+    loss = loss / seq_length
+    ------------------ backward pass -------------------
+    -- initialize gradient at time t to be zeros (there's no influence from future)
+    local drnn_state = {[seq_length] = clone_list(init_state, true)} -- true also zeros the clones
+    for t=seq_length,1,-1 do
+        -- backprop through loss, and softmax/linear
+        local doutput_t = clones.criterion[t]:backward(predictions[t], y[{{}, t}])
+        table.insert(drnn_state[t], doutput_t)
+        local dlst = clones.rnn[t]:backward({x[{{}, t}], unpack(rnn_state[t-1])}, drnn_state[t])
+        drnn_state[t-1] = {}
+        for k,v in pairs(dlst) do
+            if k > 1 then -- k == 1 is gradient on x, which we dont need
+                -- note we do k-1 because first item is dembeddings, and then follow the 
+                -- derivatives of the state, starting at index 2. I know...
+                drnn_state[t-1][k-1] = v
+            end
+        end
+    end
+    ------------------------ misc ----------------------
+    -- transfer final state to initial state (BPTT)
+    --init_state_global = rnn_state[#rnn_state] -- NOTE: I don't think this needs to be a clone, right?
+    -- clip gradient element-wise
+    grad_params:clamp(-opt.grad_clip, opt.grad_clip)
+    return loss, grad_params
+end
+
+-- start optimization here
+train_losses = {}
+val_losses = {}
+local optim_state = {learningRate = opt.learning_rate, alpha = opt.decay_rate}
+local ntrain = loader.split_sizes[1]
+if opt.eval_val_every == 0 then
+    opt.eval_val_every = ntrain
+end
+local iterations = opt.max_epochs * ntrain
+local iterations_per_epoch = ntrain
+local loss0 = nil
+for i = 1, iterations do
+    local epoch = i / ntrain
+
+    local timer = torch.Timer()
+    local _, loss = optim.rmsprop(feval, params, optim_state)
+    local time = timer:time().real
+
+    local train_loss = loss[1] -- the loss is inside a list, pop it
+    train_losses[i] = train_loss
+
+    -- exponential learning rate decay
+    if i % ntrain == 0 and opt.learning_rate_decay < 1 then
+        if epoch >= opt.learning_rate_decay_after then
+            local decay_factor = opt.learning_rate_decay
+            optim_state.learningRate = optim_state.learningRate * decay_factor -- decay it
+            print('decayed learning rate by a factor ' .. decay_factor .. ' to ' .. optim_state.learningRate)
+        end
+    end
+
+    -- every now and then or on last iteration
+    if i % opt.eval_val_every == 0 or i == iterations then
+        -- evaluate loss on validation data
+        local val_loss = eval_split(2) -- 2 = validation
+        val_losses[i] = val_loss
+
+        local savefile = string.format('%s/%s_epoch%.2f_%.4f.t7', opt.checkpoint_dir, opt.savefile, epoch, val_loss)
+        print('saving checkpoint to ' .. savefile)
+        local checkpoint = {}
+        checkpoint.protos = protos
+        checkpoint.opt = opt
+        checkpoint.train_losses = train_losses
+        checkpoint.val_loss = val_loss
+        checkpoint.val_losses = val_losses
+        checkpoint.i = i
+        checkpoint.epoch = epoch
+        checkpoint.vocab = loader.vocab_mapping
+        torch.save(savefile, checkpoint)
+    end
+
+    if i % opt.print_every == 0 then
+        print(string.format("%d/%d (epoch %.3f), train_loss = %6.8f, grad/param norm = %6.4e, time/batch = %.2fs", i, iterations, epoch, train_loss, grad_params:norm() / params:norm(), time))
+    end
+   
+    if i % 10 == 0 then collectgarbage() end
+
+    -- handle early stopping if things are going really bad
+    if loss[1] ~= loss[1] then
+        print('loss is NaN.  This usually indicates a bug.  Please check the issues page for existing issues, or create a new issue, if none exist.  Ideally, please state: your operating system, 32-bit/64-bit, your blas version, cpu/cuda/cl?')
+        break -- halt
+    end
+    if loss0 == nil then loss0 = loss[1] end
+    if loss[1] > loss0 * 3 then
+        print('loss is exploding, aborting.')
+        break -- halt
+    end
+end
+
+
