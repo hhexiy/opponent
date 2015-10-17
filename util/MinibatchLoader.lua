@@ -60,11 +60,85 @@ function MinibatchLoader:next_batch(split_index)
     end
     -- pull out the correct next batch
     local ix = self.batch_ix[split_index]
-    -- return x, y, m
-    return self.batches[split_index][1][ix], self.batches[split_index][2][ix], self.batches[split_index][3][ix]
+    -- return x, y, m, qid
+    return self.batches[split_index][1][ix], 
+        self.batches[split_index][2][ix], 
+        self.batches[split_index][3][ix], 
+        self.batches[split_index][4][ix]
 end
 
-function MinibatchLoader:text_to_tensor(in_textfile)
+function MinibatchLoader:create_mapping(vocab, special_toks)
+    -- vocab is a table of tokens: {tok:true}
+    -- special toks is an array: e.g. <eos>, unk
+    local size = 0
+    local mapping = {}
+    for tok in pairs(vocab) do 
+        size = size + 1
+        mapping[tok] = size
+    end
+    -- might want order for special toks
+    if special_toks ~= nil then
+        for i, stok in ipairs(special_toks) do
+            size = size + 1
+            mapping[stok] = size
+        end
+    end
+    return size, mapping
+end
+
+function MinibatchLoader:load_embedding(emb_dir)
+    print('loading embedding from ' .. emb_dir)
+    -- read embedding vocabulary
+    local f = io.open(emb_dir .. '/vocab.txt', 'r')
+    local emb_vocab = {}
+    local size = 0
+    while true do
+        local line = f:read()
+        if not line then break end
+        size = size + 1
+        emb_vocab[line] = size
+    end
+
+    -- load embedding
+    local emb_vec = torch.load(emb_dir .. '/vec.t7')
+    assert(emb_vec:size(1) == size)
+    local emb_size = emb_vec:size(2)
+
+    -- embedding layer
+    print('creating LookupTable...')
+    local num_unks = 0
+    local emb = nn.LookupTable(self.vocab_size, emb_size)
+    for tok, i in pairs(self.vocab_mapping) do
+        -- unk word
+        if not emb_vocab[tok] then
+            num_unks = num_unks + 1
+            emb.weight[i]:uniform(-0.05, 0.05) 
+            --emb.weight[i] = torch.randn(emb_size)
+        else
+            emb.weight[i] = torch.Tensor(emb_size):copy(emb_vec[emb_vocab[tok]])
+        end
+    end
+    print('number of unk: ' .. num_unks)
+    return emb
+end
+
+-- load questions and answers
+local QAMinibatchLoader = {}
+QAMinibatchLoader.__index = QAMinibatchLoader
+setmetatable(QAMinibatchLoader, {
+    __index = MinibatchLoader,
+    __call = function (cls, ...)
+    local self = setmetatable({}, cls)
+    self:_init(...)
+    return self
+    end,
+})
+
+function QAMinibatchLoader:_init(data_dir, input_file, batch_size)
+    MinibatchLoader:_init(data_dir, input_file, batch_size)
+end
+
+function QAMinibatchLoader:text_to_tensor(in_textfile)
     local timer = torch.Timer()
 
     local f = io.open(in_textfile, "r")
@@ -200,82 +274,12 @@ function MinibatchLoader:text_to_tensor(in_textfile)
     f:close()
 end
 
-function MinibatchLoader:create_mapping(vocab, special_toks)
-    -- vocab is a table of tokens: {tok:true}
-    -- special toks is an array: e.g. <eos>, unk
-    local size = 0
-    local mapping = {}
-    for tok in pairs(vocab) do 
-        size = size + 1
-        mapping[tok] = size
-    end
-    -- might want order for special toks
-    if special_toks ~= nil then
-        for i, stok in ipairs(special_toks) do
-            size = size + 1
-            mapping[stok] = size
-        end
-    end
-    return size, mapping
-end
-
-function MinibatchLoader:load_embedding(emb_dir)
-    print('loading embedding from ' .. emb_dir)
-    -- read embedding vocabulary
-    local f = io.open(emb_dir .. '/vocab.txt', 'r')
-    local emb_vocab = {}
-    local size = 0
-    while true do
-        local line = f:read()
-        if not line then break end
-        size = size + 1
-        emb_vocab[line] = size
-    end
-
-    -- load embedding
-    local emb_vec = torch.load(emb_dir .. '/vec.t7')
-    assert(emb_vec:size(1) == size)
-    local emb_size = emb_vec:size(2)
-
-    -- embedding layer
-    print('creating LookupTable...')
-    local num_unks = 0
-    local emb = nn.LookupTable(self.vocab_size, emb_size)
-    for tok, i in pairs(self.vocab_mapping) do
-        -- unk word
-        if not emb_vocab[tok] then
-            num_unks = num_unks + 1
-            emb.weight[i]:uniform(-0.05, 0.05) 
-            --emb.weight[i] = torch.randn(emb_size)
-        else
-            emb.weight[i] = torch.Tensor(emb_size):copy(emb_vec[emb_vocab[tok]])
-        end
-    end
-    print('number of unk: ' .. num_unks)
-    return emb
-end
-
--- load questions and answers
-local QAMinibatchLoader = {}
-QAMinibatchLoader.__index = QAMinibatchLoader
-setmetatable(QAMinibatchLoader, {
-    __index = MinibatchLoader,
-    __call = function (cls, ...)
-    local self = setmetatable({}, cls)
-    self:_init(...)
-    return self
-    end,
-})
-
-function QAMinibatchLoader:_init(data_dir, input_file, batch_size)
-    MinibatchLoader:_init(data_dir, input_file, batch_size)
-end
-
 function QAMinibatchLoader:make_batches(data, batch_size)
     -- data is a tensor of one split
     local x_batches = {}
     local y_batches = {}
     local m_batches = {} -- mask for padded data
+    local qid_batches = {}
     local N = data:size(1)
     local num_batches = math.floor(N / batch_size)
     for i=1,num_batches do
@@ -290,6 +294,7 @@ function QAMinibatchLoader:make_batches(data, batch_size)
         end
         local seq_length = data[{{from,to}, 3}]:max() -- for padding
         x_batches[i] = data[{{from,to}, {4, 3+seq_length}}]
+        qid_batches[i] = data[{{from,to}, 1}]
         -- use same labels for padded word
         --y_batches[i] = torch.IntTensor(batch_size, 1):copy(data[{{from,to}, 2}]):expand(batch_size, seq_length)
         -- use <eos> as label for padded word
@@ -319,7 +324,7 @@ function QAMinibatchLoader:make_batches(data, batch_size)
             end
         end
     end
-    return {x_batches, y_batches, m_batches}
+    return {x_batches, y_batches, m_batches, qid_batches}
 end
 
 -- load questions and buzzes

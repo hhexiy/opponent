@@ -25,6 +25,7 @@ require 'util.misc'
 --local QAMinibatchLoader = require 'util.QAMinibatchLoader'
 local MinibatchLoader = require 'util.MinibatchLoader'
 local model_utils = require 'util.model_utils'
+local eval = require 'util.eval'
 local LSTM = require 'model.LSTM'
 local GRU = require 'model.GRU'
 local RNN = require 'model.RNN'
@@ -133,6 +134,7 @@ end
 print('word embedding size: ' .. emb_size)
 
 -- predict answer at each input word
+-- TODO: different output_size for different models
 local output_size = loader.ans_size
 
 -- make sure output directory exists
@@ -218,54 +220,10 @@ for name,proto in pairs(protos) do
 end
 print('done')
 
--- compute accuracy
-function accuracy(pred, gold, mask)
-    -- isSameSizeAs require same type too!
-    assert(pred:isSameSizeAs(gold) and gold:isSize(mask:size()), 'dimension mismatch')
-    local correct = pred:maskedSelect(mask):eq(gold:maskedSelect(mask))
-    return correct:sum() / correct:size(1) 
-end
-
-function seq_accuracy(pred, gold, mask)
-    local correct = 0
-    for i=1,pred:size(1) do 
-        local len = mask[i]:sum()
-        if pred[i][len] == gold[i][len] then
-            correct = correct + 1
-        end
-    end
-    return correct / pred:size(1)
-end
-
-function max_seq_accuracy(pred, gold, mask)
-    local correct = 0
-    for i=1,pred:size(1) do 
-        if pred[i]:maskedSelect(mask[i]):eq(gold[i][1]):sum() > 0 then
-            correct = correct + 1
-        end
-    end
-    return correct / pred:size(1)
-end
-
--- predict the majority class
-function constant_baseline(gold, mask)
-    local correct  = gold:maskedSelect(mask):eq(loader.sorted_ans[1])
-    return correct:sum() / correct:size(1) 
-end
-
--- predict the average buzz position
-function average_baseline(gold, mask)
-    average_buzz_pos = math.ceil((gold:eq(1):sum() / gold:size(1)) + 1)
-    print('average buzz pos:' .. average_buzz_pos)
-    pred = torch.Tensor(gold:size()):fill(2)
-    pred:narrow(2, 1, average_buzz_pos):fill(1)
-    return accuracy(pred, gold, mask)
-end
-
 -- get next batch
 function get_next_batch(split_index)
     -- fetch a batch
-    local x, y, m = loader:next_batch(split_index)
+    local x, y, m, qid = loader:next_batch(split_index)
     if opt.gpuid >= 0 and opt.opencl == 0 then -- ship the input arrays to GPU
         -- have to convert to float because integers can't be cuda()'d
         x = x:float():cuda()
@@ -275,7 +233,7 @@ function get_next_batch(split_index)
         x = x:cl()
         y = y:cl()
     end
-    return x, y, m
+    return x, y, m, qid
 end
 
 -- evaluate the loss over an entire split
@@ -291,20 +249,24 @@ function eval_split(split_index, max_batches)
     local rnn_state = {[0] = init_state}
     local pred = torch.IntTensor(n*opt.batch_size, loader.max_seq_length)
     local gold = torch.IntTensor(n*opt.batch_size, loader.max_seq_length)
+    local qids = torch.IntTensor(n*opt.batch_size)
     local mask = torch.ByteTensor(n*opt.batch_size, loader.max_seq_length):fill(0)
+    local logprobs = torch.Tensor(n*opt.batch_size, loader.max_seq_length, output_size):fill(0)
     local total_length = 0 -- sum of seq length of each batch
     
     for i = 1,n do -- iterate over batches in the split
         -- fetch a batch
-        local x, y, m = get_next_batch(split_index)
+        local x, y, m, qid = get_next_batch(split_index)
         -- seq_length is different for each batch (max length in *this* batch)
         local seq_length = x:size(2)
         total_length = total_length + seq_length
         -- starting id of this batch
         local from = (i-1)*opt.batch_size + 1
         local to = from+opt.batch_size-1
+        -- TODO: instead of copy, try set
         gold:sub(from, to, 1, seq_length):copy(y)
         mask:sub(from, to, 1, seq_length):copy(m)
+        qids:sub(from, to):copy(qid)
 
         -- forward pass
         for t=1,seq_length do
@@ -314,19 +276,20 @@ function eval_split(split_index, max_batches)
             for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end
             prediction = lst[#lst] 
             loss = loss + clones.criterion[t]:forward(prediction, y[{{}, t}]:type('torch.DoubleTensor'))
-            -- TODO: record all probs in output 
             _, p = torch.max(prediction, 2)
             pred:sub(from, to, t, t):copy(p)
+            logprobs:sub(from, to, t, t, 1, -1):copy(prediction)
         end
         --print(i .. '/' .. n .. '...')
     end
 
-    acc = accuracy(pred, gold, mask)
-    seq_acc = seq_accuracy(pred, gold, mask)
-    max_seq_acc = max_seq_accuracy(pred, gold, mask)
-    const_baseline = constant_baseline(gold, mask, output_size)
+    acc = eval.accuracy(pred, gold, mask)
+    seq_acc = eval.seq_accuracy(pred, gold, mask)
+    max_seq_acc = eval.max_seq_accuracy(pred, gold, mask)
+    --const_baseline = eval.constant_baseline(gold, mask, loader.sorted_ans[1])
+    payoff, mean_pos = eval.max_margin_buzz(logprobs, gold, mask, qids, loader.buzzes) 
     loss = loss / total_length
-    print(string.format('loss = %.8f, acc = %.4f, seq_acc = %.4f, max_seq_acc = %.4f, const baseline = %.4f', loss, acc, seq_acc, max_seq_acc, const_baseline))
+    print(string.format('loss = %.8f, acc = %.4f, seq_acc = %.4f, max_seq_acc = %.4f, payoff = (%.4f, %.4f), ', loss, acc, seq_acc, max_seq_acc, payoff, mean_pos))
     return loss
 end
 
