@@ -19,7 +19,10 @@ def clean_text(q):
     q = q.replace('~', '')
     q = q.replace('(*)', '')
     q = q.replace('*', '')
+    # don't remove BUZZ position
+    q = re.sub(r'\[.*?BUZZ.*?\]', 'BUZZ', q)
     q = re.sub(r'\[.*?\]', '', q)
+    q = re.sub(r'\(.*?BUZZ.*?\)', 'BUZZ', q)
     q = re.sub(r'\(.*?\)', '', q)
     q = re.sub(r'\?+', '', q)
 
@@ -48,25 +51,32 @@ def map_buzz_pos(buzz_pos, q):
     q = clean_text(' '.join(words))
     # get new buzz position
     ss = q.split()
+    old_buzz_pos = buzz_pos
     buzz_pos = None
     for i, s in enumerate(ss):
         if s == 'BUZZ':
             buzz_pos = i
             break
+    if buzz_pos is None:
+        print old_buzz_pos, q
+        print len(words), words
+        sys.exit()
     assert buzz_pos is not None
     return buzz_pos
 
-def assign_fold(probs):
+def assign_fold(probs, n):
     # probs = p(train), p(dev), p(test)
-    p = np.cumsum(probs)
-    while True:
-        r = random.uniform(0, 1)
-        if r <= p[0]:
-            yield 'train'
-        elif r > p[0] and r <= p[1]:
-            yield 'dev'
-        else:
-            yield 'test'
+    # n = number of examples
+    ntrain = int(probs[0] * n)
+    ndev = max(int(probs[1] * n), 1)
+    ntest = n - ntrain - ndev
+    if ntest == 0:
+        ntrain -= 1
+        ntest += 1
+    assert ntrain > 0 and ndev > 0 and ntest > 0
+    folds = ['train']*ntrain + ['dev']*ndev + ['test']*ntest
+    random.shuffle(folds)
+    return folds
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -154,21 +164,32 @@ if __name__ == '__main__':
     # make sure each answer has questions in each set
     probs = [args.train_frac, args.dev_frac, 1.0-args.dev_frac-args.train_frac]
     fold_count = defaultdict(int)
+    users = defaultdict(set)
     for ans, q in ans_question.items():
-        for qid, fold in izip(q, assign_fold(probs)):
+        folds = assign_fold(probs, len(q))
+        for qid, fold in izip(q, folds):
             questions[qid].append(fold)
             fold_count[fold] += 1
             qtext = questions[qid][1].strip().lower()
             # update buzz position relative to cleaned text
             for i, buzz in enumerate(buzzes[qid]):
                 uid, buzz_pos, correct = buzz
-                if qid == 117294:
-                    new_buzz_pos = map_buzz_pos(buzz_pos, qtext)
-                    buzz[1] = new_buzz_pos
-                    assert(buzzes[qid][i][1] == new_buzz_pos)
+                users[fold].add(uid)
+                new_buzz_pos = map_buzz_pos(buzz_pos, qtext)
+                buzz[1] = new_buzz_pos
+                assert(buzzes[qid][i][1] == new_buzz_pos)
             questions[qid][1] = clean_text(qtext)
+            qlen = len(questions[qid][1].split())
+            for i, buzz in enumerate(buzzes[qid]):
+                assert buzz[1] <= qlen
+
+    # stats for train, dev, test
+    str_format = '{:<10}{:<10}{:<10}{:<10}'
+    print str_format.format('split', '#example', '#user', '#new')
     for fold, count in fold_count.items():
-        print '%s: %d' % (fold, count)
+        nusers = len(users[fold])
+        nnew = nusers - len(users[fold].intersection(users['train']))
+        print str_format.format(fold, count, nusers, nnew)
 
     # print
     qids = questions.keys()

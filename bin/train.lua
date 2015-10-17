@@ -15,13 +15,15 @@ which is turn based on other stuff in Torch, etc... (long lineage)
 
 require 'torch'
 require 'nn'
-require 'util.mynngraph'
+require 'nngraph'
+nngraph.setDebug(true)
 require 'optim'
 require 'lfs'
 
 require 'util.OneHot'
 require 'util.misc'
-local QBMinibatchLoader = require 'util.QBMinibatchLoader'
+--local QAMinibatchLoader = require 'util.QAMinibatchLoader'
+local MinibatchLoader = require 'util.MinibatchLoader'
 local model_utils = require 'util.model_utils'
 local LSTM = require 'model.LSTM'
 local GRU = require 'model.GRU'
@@ -40,7 +42,8 @@ cmd:option('-input_file','input.txt','data file name')
 -- model params
 cmd:option('-rnn_size', 128, 'size of LSTM internal state')
 cmd:option('-num_layers', 1, 'number of layers in the LSTM')
-cmd:option('-model', 'lstm', 'lstm,gru or rnn')
+cmd:option('-rnn', 'lstm', 'lstm, gru or rnn')
+cmd:option('-model', 'qa', 'qa, qb or qab')
 cmd:option('-embedding', 'dat/glove', 'directory of pretrained word embeddings')
 -- optimization
 cmd:option('-learning_rate',2e-3,'learning rate')
@@ -67,6 +70,8 @@ cmd:option('-gpuid',0,'which gpu to use. -1 = use CPU')
 cmd:option('-opencl',0,'use OpenCL (instead of CUDA)')
 -- debug
 cmd:option('-debug',0,'debug mode: printouts and assertions')
+-- test
+cmd:option('-test',0,'evaluate on test set')
 cmd:text()
 
 -- parse input params
@@ -110,7 +115,8 @@ if opt.gpuid >= 0 and opt.opencl == 1 then
 end
 
 -- create the data loader class
-local loader = QBMinibatchLoader.create(opt.data_dir, opt.input_file, opt.batch_size)
+local loader = MinibatchLoader[opt.model](opt.data_dir, opt.input_file, opt.batch_size)
+loader:load_data()
 local vocab_size = loader.vocab_size  
 local vocab = loader.vocab_mapping
 
@@ -133,6 +139,14 @@ local output_size = loader.ans_size
 if not path.exists(opt.checkpoint_dir) then lfs.mkdir(opt.checkpoint_dir) end
 
 -- define the model: prototypes for one timestep, then clone them in time
+local num_inputs = 1
+local num_outputs = 1
+if opt.model == 'qb' then
+    num_inputs = 2
+elseif opt.model == 'qab' then
+    num_inputs = 2
+    num_outputs = 2
+end
 local do_random_init = true
 if string.len(opt.init_from) > 0 then
     print('loading an LSTM from checkpoint ' .. opt.init_from)
@@ -152,17 +166,19 @@ if string.len(opt.init_from) > 0 then
     opt.num_layers = checkpoint.opt.num_layers
     do_random_init = false
 else
-    print('creating an ' .. opt.model .. ' with ' .. opt.num_layers .. ' layers')
+    print('creating an ' .. opt.rnn .. ' with ' .. opt.num_layers .. ' layers')
     protos = {}
-    if opt.model == 'lstm' then
+    if opt.rnn == 'lstm' then
         protos.rnn = LSTM.lstm(emb, output_size, opt.rnn_size, opt.num_layers, opt.dropout)
-    -- TODO: fix rnn and gru
-    elseif opt.model == 'gru' then
-        protos.rnn = GRU.gru(vocab_size, output_size, opt.rnn_size, opt.num_layers, opt.dropout)
-    elseif opt.model == 'rnn' then
+    -- TODO: fix rnn
+    elseif opt.rnn == 'gru' then
+        protos.rnn = GRU.gru(emb, output_size, opt.rnn_size, opt.num_layers, opt.dropout)
+        --protos.rnn = GRU.gru_new({emb}, {output_size}, opt.rnn_size, opt.num_layers, opt.dropout)
+    elseif opt.rnn == 'rnn' then
         protos.rnn = RNN.rnn(vocab_size, output_size, opt.rnn_size, opt.num_layers, opt.dropout)
     end
     protos.criterion = nn.ClassNLLCriterion()
+    --protos.criterion = nn.MultiMarginCriterion()
 end
 
 -- the initial state of the cell/hidden states
@@ -172,7 +188,7 @@ for L=1,opt.num_layers do
     if opt.gpuid >=0 and opt.opencl == 0 then h_init = h_init:cuda() end
     if opt.gpuid >=0 and opt.opencl == 1 then h_init = h_init:cl() end
     table.insert(init_state, h_init:clone())
-    if opt.model == 'lstm' then
+    if opt.rnn == 'lstm' then
         table.insert(init_state, h_init:clone())
     end
 end
@@ -210,8 +226,25 @@ function accuracy(pred, gold, mask)
     return correct:sum() / correct:size(1) 
 end
 
---TODO
 function seq_accuracy(pred, gold, mask)
+    local correct = 0
+    for i=1,pred:size(1) do 
+        local len = mask[i]:sum()
+        if pred[i][len] == gold[i][len] then
+            correct = correct + 1
+        end
+    end
+    return correct / pred:size(1)
+end
+
+function max_seq_accuracy(pred, gold, mask)
+    local correct = 0
+    for i=1,pred:size(1) do 
+        if pred[i]:maskedSelect(mask[i]):eq(gold[i][1]):sum() > 0 then
+            correct = correct + 1
+        end
+    end
+    return correct / pred:size(1)
 end
 
 -- predict the majority class
@@ -280,7 +313,7 @@ function eval_split(split_index, max_batches)
             rnn_state[t] = {}
             for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end
             prediction = lst[#lst] 
-            loss = loss + clones.criterion[t]:forward(prediction, y[{{}, t}])
+            loss = loss + clones.criterion[t]:forward(prediction, y[{{}, t}]:type('torch.DoubleTensor'))
             -- TODO: record all probs in output 
             _, p = torch.max(prediction, 2)
             pred:sub(from, to, t, t):copy(p)
@@ -289,9 +322,11 @@ function eval_split(split_index, max_batches)
     end
 
     acc = accuracy(pred, gold, mask)
+    seq_acc = seq_accuracy(pred, gold, mask)
+    max_seq_acc = max_seq_accuracy(pred, gold, mask)
     const_baseline = constant_baseline(gold, mask, output_size)
     loss = loss / total_length
-    print(string.format('loss = %.8f, acc = %.4f, const baseline = %.4f', loss, acc, const_baseline))
+    print(string.format('loss = %.8f, acc = %.4f, seq_acc = %.4f, max_seq_acc = %.4f, const baseline = %.4f', loss, acc, seq_acc, max_seq_acc, const_baseline))
     return loss
 end
 
@@ -317,7 +352,7 @@ function feval(x)
         for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end -- extract the state, without output
         predictions[t] = lst[#lst] -- last element is the prediction
         --print(predictions[t], y[{{}, t}])
-        loss = loss + clones.criterion[t]:forward(predictions[t], y[{{}, t}])
+        loss = loss + clones.criterion[t]:forward(predictions[t], y[{{}, t}]:type('torch.DoubleTensor'))
     end
     loss = loss / seq_length
     ------------------ backward pass -------------------
@@ -325,15 +360,15 @@ function feval(x)
     local drnn_state = {[seq_length] = clone_list(init_state, true)} -- true also zeros the clones
     for t=seq_length,1,-1 do
         -- backprop through loss, and softmax/linear
-        local doutput_t = clones.criterion[t]:backward(predictions[t], y[{{}, t}])
+        local doutput_t = clones.criterion[t]:backward(predictions[t], y[{{}, t}]:type('torch.DoubleTensor'))
         table.insert(drnn_state[t], doutput_t)
         local dlst = clones.rnn[t]:backward({x[{{}, t}], unpack(rnn_state[t-1])}, drnn_state[t])
         drnn_state[t-1] = {}
         for k,v in pairs(dlst) do
-            if k > 1 then -- k == 1 is gradient on x, which we dont need
+            if k > num_inputs then -- k == [1,num_inputs] is gradient on x, which we dont need
                 -- note we do k-1 because first item is dembeddings, and then follow the 
                 -- derivatives of the state, starting at index 2. I know...
-                drnn_state[t-1][k-1] = v
+                drnn_state[t-1][k-num_inputs] = v
             end
         end
     end
@@ -345,10 +380,17 @@ function feval(x)
     return loss, grad_params
 end
 
+-- test only
+if opt.test == 1 then
+    local test_loss = eval_split(3)
+    os.exit()
+end
+
 -- start optimization here
 train_losses = {}
 val_losses = {}
 local optim_state = {learningRate = opt.learning_rate, alpha = opt.decay_rate}
+--local optim_state = {learningRate = opt.learning_rate}
 local ntrain = loader.split_sizes[1]
 if opt.eval_val_every == 0 then
     opt.eval_val_every = ntrain
