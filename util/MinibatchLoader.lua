@@ -2,17 +2,9 @@
 -- Modified from https://github.com/oxford-cs-ml-2015/practical6
 -- the modification included support for train/val/test splits
 
-local MinibatchLoader = {}
-MinibatchLoader.__index = MinibatchLoader
-setmetatable(MinibatchLoader, {
-    __call = function (cls, ...)
-    local self = setmetatable({}, cls)
-    self:_init(...)
-    return self
-    end,
-})
+local MinibatchLoader = torch.class('qb.MinibatchLoader')
 
-function MinibatchLoader:_init(data_dir, input_file, batch_size)
+function MinibatchLoader:__init(data_dir, input_file, batch_size)
     self.input_file = path.join(data_dir, input_file)
     self.batch_size = batch_size
 end
@@ -46,7 +38,8 @@ function MinibatchLoader:reset_batch_pointer(split_index, batch_index)
     self.batch_ix[split_index] = batch_index
 end
 
-function MinibatchLoader:next_batch(split_index)
+function MinibatchLoader:next_batch(split_index, gpuid)
+    gpuid = gpuid or -1
     if self.split_sizes[split_index] == 0 then
         -- perform a check here to make sure the user isn't screwing something up
         local split_names = {'train', 'val', 'test'}
@@ -61,10 +54,19 @@ function MinibatchLoader:next_batch(split_index)
     -- pull out the correct next batch
     local ix = self.batch_ix[split_index]
     -- return x, y, m, qid
-    return self.batches[split_index][1][ix], 
-        self.batches[split_index][2][ix], 
-        self.batches[split_index][3][ix], 
-        self.batches[split_index][4][ix]
+    local x = self.batches[split_index][1][ix]
+    local y = self.batches[split_index][2][ix] 
+    local m = self.batches[split_index][3][ix] 
+    local qid = self.batches[split_index][4][ix]
+    -- ship the input arrays to GPU
+    if gpuid >= 0 then
+        -- have to convert to float because integers can't be cuda()'d
+        x = x:float():cuda()
+        y = y:float():cuda()
+        m = m:float():cuda()
+        qid = qid:float():cuda()
+    end
+    return x, y, m, qid
 end
 
 function MinibatchLoader:create_mapping(vocab, special_toks)
@@ -123,19 +125,10 @@ function MinibatchLoader:load_embedding(emb_dir)
 end
 
 -- load questions and answers
-local QAMinibatchLoader = {}
-QAMinibatchLoader.__index = QAMinibatchLoader
-setmetatable(QAMinibatchLoader, {
-    __index = MinibatchLoader,
-    __call = function (cls, ...)
-    local self = setmetatable({}, cls)
-    self:_init(...)
-    return self
-    end,
-})
+local QAMinibatchLoader = torch.class('qb.QAMinibatchLoader', 'qb.MinibatchLoader')
 
-function QAMinibatchLoader:_init(data_dir, input_file, batch_size)
-    MinibatchLoader:_init(data_dir, input_file, batch_size)
+function QAMinibatchLoader:__init(data_dir, input_file, batch_size)
+    MinibatchLoader:__init(data_dir, input_file, batch_size)
 end
 
 function QAMinibatchLoader:text_to_tensor(in_textfile)
@@ -328,19 +321,10 @@ function QAMinibatchLoader:make_batches(data, batch_size)
 end
 
 -- load questions and buzzes
-local QBMinibatchLoader = {}
-QBMinibatchLoader.__index = QBMinibatchLoader
-setmetatable(QBMinibatchLoader, {
-    __index = MinibatchLoader,
-    __call = function (cls, ...)
-    local self = setmetatable({}, cls)
-    self:_init(...)
-    return self
-    end,
-})
+local QBMinibatchLoader = torch.class('qb.QBMinibatchLoader', 'qb.MinibatchLoader')
 
-function QBMinibatchLoader:_init(data_dir, input_file, batch_size)
-    MinibatchLoader:_init(data_dir, input_file, batch_size)
+function QBMinibatchLoader:__init(data_dir, input_file, batch_size)
+    MinibatchLoader:__init(data_dir, input_file, batch_size)
 end
 
 function QBMinibatchLoader:make_batches(data, batch_size)
@@ -393,7 +377,4 @@ function QBMinibatchLoader:make_batches(data, batch_size)
     end
     return {x_batches, y_batches, m_batches}
 end
-
---return MinibatchLoader
-return {qa=QAMinibatchLoader, qb=QBMinibatchLoader}
 

@@ -11,3 +11,14 @@ function clone_list(tensor_list, zero_too)
     end
     return out
 end
+
+function check_vocab_compatible(old_vocab, new_vocab)
+    -- old_vocab \subseteq new_vocab
+    for c,i in pairs(old_vocab) do 
+        if not new_vocab[c] == i then 
+            return false
+        end
+    end
+    return true
+end
+
