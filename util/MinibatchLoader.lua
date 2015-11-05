@@ -2,18 +2,23 @@
 -- Modified from https://github.com/oxford-cs-ml-2015/practical6
 -- the modification included support for train/val/test splits
 
+require 'util.misc'
+
 local MinibatchLoader = torch.class('qb.MinibatchLoader')
+
+qb.UNK = '<unk>'
+qb.PAD = '<eos>'
 
 function MinibatchLoader:__init(data_dir, input_file, batch_size)
     self.input_file = path.join(data_dir, input_file)
     self.batch_size = batch_size
 end
 
-function MinibatchLoader:load_data()
+function MinibatchLoader:load_data(vocab_mapping, ans_mapping)
     -- create mappings: vocab and ans 
     -- and tables: questions and buzzes
     print('loading data from text file ' .. self.input_file)
-    self:text_to_tensor(self.input_file)
+    self:text_to_tensor(self.input_file, vocab_mapping, ans_mapping)
 
     -- make batches: {x, y, mask}
     -- train=1; dev=2; test=3
@@ -21,8 +26,13 @@ function MinibatchLoader:load_data()
     self.split_sizes = {}
     self.batches = {}
     for split_index=1,3 do
-        self.batches[split_index] = self:make_batches(self.questions[split_index], self.batch_size)
-        local nbatches = #self.batches[split_index][1]
+        local nbatches
+        if self.questions[split_index] == nil then
+            nbatches = 0
+        else
+            self.batches[split_index] = self:make_batches(self.questions[split_index], self.batch_size)
+            nbatches = #self.batches[split_index][1]
+        end
         self.split_sizes[split_index] = nbatches
         print(string.format('split %d: %d batches', split_index, nbatches))
     end
@@ -38,8 +48,7 @@ function MinibatchLoader:reset_batch_pointer(split_index, batch_index)
     self.batch_ix[split_index] = batch_index
 end
 
-function MinibatchLoader:next_batch(split_index, gpuid)
-    gpuid = gpuid or -1
+function MinibatchLoader:next_batch(split_index)
     if self.split_sizes[split_index] == 0 then
         -- perform a check here to make sure the user isn't screwing something up
         local split_names = {'train', 'val', 'test'}
@@ -59,7 +68,7 @@ function MinibatchLoader:next_batch(split_index, gpuid)
     local m = self.batches[split_index][3][ix] 
     local qid = self.batches[split_index][4][ix]
     -- ship the input arrays to GPU
-    if gpuid >= 0 then
+    if opt.gpuid >= 0 then
         -- have to convert to float because integers can't be cuda()'d
         x = x:float():cuda()
         y = y:float():cuda()
@@ -111,7 +120,7 @@ function MinibatchLoader:load_embedding(emb_dir)
     local num_unks = 0
     local emb = nn.LookupTable(self.vocab_size, emb_size)
     for tok, i in pairs(self.vocab_mapping) do
-        -- unk word
+        -- word without pretrained embedding
         if not emb_vocab[tok] then
             num_unks = num_unks + 1
             emb.weight[i]:uniform(-0.05, 0.05) 
@@ -120,7 +129,7 @@ function MinibatchLoader:load_embedding(emb_dir)
             emb.weight[i] = torch.Tensor(emb_size):copy(emb_vec[emb_vocab[tok]])
         end
     end
-    print('number of unk: ' .. num_unks)
+    print('# words without pretrained embedding: ' .. num_unks)
     return emb
 end
 
@@ -131,16 +140,28 @@ function QAMinibatchLoader:__init(data_dir, input_file, batch_size)
     MinibatchLoader:__init(data_dir, input_file, batch_size)
 end
 
-function QAMinibatchLoader:text_to_tensor(in_textfile)
+function QAMinibatchLoader:text_to_tensor(in_textfile, vocab_mapping, ans_mapping)
     local timer = torch.Timer()
 
     local f = io.open(in_textfile, "r")
     
     -- create vocabulary if it doesn't exist yet
-    print('creating vocabulary mapping...')
-    -- record all words to a set
-    local vocab = {}
+    local vocab, num_unks
+    if vocab_mapping == nil then
+        print('creating vocabulary mapping...')
+        vocab = {}
+    else
+        print('using given vocabulary mapping...')
+        num_unks = 0
+        vocab = vocab_mapping
+    end
+    -- create answer set if it doesn't exist yet
     local ans = {}
+    if ans_mapping == nil then
+        print('creating answer mapping...')
+    else
+        print('using given answer mapping...')
+    end
     local user = {}
     local maxlen = 0
     local num_examples = 0
@@ -148,11 +169,21 @@ function QAMinibatchLoader:text_to_tensor(in_textfile)
     while true do
         local line = f:read()
         if line == nil then break end
-        local ss = string.split(line, ',')
+        local ss = string.split(line, ' ||| ')
         -- tok dict
         local toks = string.split(ss[4], ' ')
         for i, tok in pairs(toks) do
-            if vocab[tok] == nil then vocab[tok] = true end
+            if vocab[tok] == nil then 
+                if vocab_mapping == nil then
+                    vocab[tok] = true 
+                else
+                    num_unks = num_unks + 1
+                end
+            end
+        end
+        -- check answer is in given answer mapping
+        if ans_mapping ~= nil then
+            assert(ans_mapping[ss[2]] ~= nil)
         end
         -- ans dict (count)
         if ans[ss[2]] == nil then 
@@ -182,19 +213,31 @@ function QAMinibatchLoader:text_to_tensor(in_textfile)
     end
     f:close()
 
-    self.vocab_size, self.vocab_mapping = self:create_mapping(vocab, {'<eos>'})
-    self.ans_size, self.ans_mapping = self:create_mapping(ans, {'<eos>'})
+    if vocab_mapping == nil then
+        self.vocab_size, self.vocab_mapping = self:create_mapping(vocab, {qb.PAD, qb.UNK})
+    else
+        self.vocab_mapping = vocab_mapping
+        self.vocab_size = table_size(vocab_mapping)
+        print('# unknown words: ' .. num_unks)
+    end
+    if ans_mapping == nil then
+        self.ans_size, self.ans_mapping = self:create_mapping(ans, {qb.PAD})
+    else
+        self.ans_mapping = ans_mapping
+        self.ans_size = table_size(ans_mapping)
+    end
     self.user_size, self.user_mapping = self:create_mapping(user, {})
 
-    print(string.format('number of examples: %d(%d/%d/%d)', num_examples, split_sizes[1], split_sizes[2], split_sizes[3]))
+    self.num_examples = split_sizes
+    print(string.format('# examples: %d(%d/%d/%d)', num_examples, split_sizes[1], split_sizes[2], split_sizes[3]))
     print('maximum sequence length: ' .. maxlen)
     self.max_seq_length = maxlen
     print('vocab size: ' .. self.vocab_size)
-    print('number of answers/classes: ' .. self.ans_size)
-    print('number of users: ' .. self.user_size)
+    print('# answers/classes: ' .. self.ans_size)
+    print('# users: ' .. self.user_size)
 
     -- answer counts
-    local ans_count = torch.IntTensor(self.ans_size)
+    local ans_count = torch.IntTensor(self.ans_size):zero()
     for a, n in pairs(ans) do
         ans_count[self.ans_mapping[a]] = n
     end
@@ -214,7 +257,9 @@ function QAMinibatchLoader:text_to_tensor(in_textfile)
     self.buzzes = {}
     for split_index=1,3 do
         -- +3: qid, ans, length of question 
-        self.questions[split_index] = torch.IntTensor(split_sizes[split_index], maxlen+3)
+        if split_sizes[split_index] > 0 then
+            self.questions[split_index] = torch.IntTensor(split_sizes[split_index], maxlen+3)
+        end
     end
     f = io.open(in_textfile, "r")
     local split_count = {0, 0, 0}
@@ -223,7 +268,7 @@ function QAMinibatchLoader:text_to_tensor(in_textfile)
         local line = f:read()
         if line == nil then break end
 
-        local ss = string.split(line, ',')
+        local ss = string.split(line, ' ||| ')
         local split_index = ss[3] == 'train' and 1 or ss[3] == 'dev' and 2 or 3
         split_count[split_index] = split_count[split_index] + 1
 
@@ -235,21 +280,25 @@ function QAMinibatchLoader:text_to_tensor(in_textfile)
         local toks = string.split(ss[4], ' ')
         t[3] = #toks -- len
         for i, tok in ipairs(toks) do
-            t[i+3] = self.vocab_mapping[tok]
+            if self.vocab_mapping[tok] == nil then
+                t[i+3] = self.vocab_mapping[qb.UNK]
+            else
+                t[i+3] = self.vocab_mapping[tok]
+            end
         end
         -- pad
         if #toks < maxlen then
             for i = #toks+1, maxlen do
-                t[i+3] = self.vocab_mapping['<eos>']
+                t[i+3] = self.vocab_mapping[qb.PAD]
             end
         end
 
         -- buzz data
-        self.buzzes[qid] = {}
         -- lua string.split removes empty string :(
         if #ss == 4 then
             num_nobuzz = num_nobuzz + 1
         else
+            self.buzzes[qid] = {}
             local buzzes = string.split(ss[5], '|')
             for i, buzz in ipairs(buzzes) do
                 --print(buzz)
@@ -263,7 +312,7 @@ function QAMinibatchLoader:text_to_tensor(in_textfile)
             end
         end
     end
-    print('number of questions without buzz: ' .. num_nobuzz)
+    print('# questions without buzz: ' .. num_nobuzz)
     f:close()
 end
 
@@ -294,7 +343,7 @@ function QAMinibatchLoader:make_batches(data, batch_size)
         y_batches[i] = torch.IntTensor(batch_size, 1):copy(data[{{from,to}, 2}]):repeatTensor(1, seq_length)
         for j=from,to do
             if data[j][3]+1 < seq_length then
-                y_batches[i][j-from+1]:sub(data[j][3]+1, -1):fill(self.ans_mapping['<eos>'])
+                y_batches[i][j-from+1]:sub(data[j][3]+1, -1):fill(self.ans_mapping[qb.PAD])
             end
         end
         if opt.debug == 1 then
@@ -352,7 +401,7 @@ function QBMinibatchLoader:make_batches(data, batch_size)
         y_batches[i] = torch.IntTensor(batch_size, 1):copy(data[{{from,to}, 2}]):repeatTensor(1, seq_length)
         for j=from,to do
             if data[j][3]+1 < seq_length then
-                y_batches[i][j-from+1]:sub(data[j][3]+1, -1):fill(self.ans_mapping['<eos>'])
+                y_batches[i][j-from+1]:sub(data[j][3]+1, -1):fill(self.ans_mapping[qb.PAD])
             end
         end
         if opt.debug == 1 then

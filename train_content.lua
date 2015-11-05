@@ -30,7 +30,7 @@ cmd:option('-input_file','input.txt','data file name')
 -- model params
 cmd:option('-rnn_size', 128, 'size of LSTM internal state')
 cmd:option('-num_layers', 1, 'number of layers in the LSTM')
-cmd:option('-rnn', 'lstm', 'lstm, gru or rnn')
+cmd:option('-rnn', 'gru', 'lstm, gru or rnn')
 cmd:option('-embedding', 'dat/glove', 'directory of pretrained word embeddings')
 -- optimization
 cmd:option('-learning_rate',2e-3,'learning rate')
@@ -88,15 +88,28 @@ end
 -- make sure output directory exists
 if not path.exists(opt.checkpoint_dir) then lfs.mkdir(opt.checkpoint_dir) end
 
-qb = {}
-include('util/MinibatchLoader.lua')
+if not qb then
+    qb = {}
+    include('util/MinibatchLoader.lua')
+    include('model/QBModels.lua')
+end
 
--- create the data loader class
-local loader = nil
-loader = qb.QAMinibatchLoader(opt.data_dir, opt.input_file, opt.batch_size)
-loader:load_data()
-qb.vocab_size = loader.vocab_size  
-qb.vocab = loader.vocab_mapping
+local loader = qb.QAMinibatchLoader(opt.data_dir, opt.input_file, opt.batch_size)
+local checkpoint
+if string.len(opt.init_from) > 0 then
+    print('loading content model from ' .. opt.init_from)
+    checkpoint = torch.load(opt.init_from)
+    qb.vocab_mapping = checkpoint.vocab_mapping
+    qb.ans_mapping = checkpoint.ans_mapping
+    loader:load_data(qb.vocab_mapping, qb.ans_mapping)
+else
+    loader:load_data()
+    qb.vocab_size = loader.vocab_size  
+    qb.vocab_mapping = loader.vocab_mapping
+    qb.ans_mapping = loader.ans_mapping
+end
+qb.ans_size = loader.ans_size
+qb.max_seq_length = loader.max_seq_length
 
 -- word embedding
 if string.len(opt.embedding) > 0 then
@@ -108,22 +121,10 @@ else
 end
 print('word embedding size: ' .. qb.emb_size)
 
-qb.ans_size = loader.ans_size
-qb.max_seq_length = loader.max_seq_length
-
-include('model/QBModels.lua')
-
-function load_model(path)
-    local checkpoint = torch.load(path)
-    local vocab_compatible = check_vocab_compatible(checkpoint.vocab, qb.vocab)
-    assert(vocab_compatible, 'error, the character vocabulary for this dataset and the one in the saved checkpoint are not the same. This is trouble.')
-    return checkpoint.rnn
-end
 
 local content_rnn, content_model, random_init
-if string.len(opt.init_from) > 0 then
-    print('loading content model from ' .. opt.init_from)
-    content_rnn = load_model(opt.init_from)
+if checkpoint then
+    content_rnn = checkpoint.model 
     content_rnn.net_params.batch_size = opt.batch_size
     random_init = false
 else
@@ -202,7 +203,7 @@ end
 
 -- test only
 if opt.test == 1 then
-    local test_loss = eval_split(3)
+    local test_loss = eval_split(2)
     os.exit()
 end
 
@@ -247,14 +248,15 @@ for i = 1, iterations do
         local savefile = string.format('%s/%s_epoch%.2f_%.4f.t7', opt.checkpoint_dir, opt.savefile, epoch, val_loss)
         print('saving checkpoint to ' .. savefile)
         local checkpoint = {}
-        checkpoint.rnn = content_rnn
+        checkpoint.model = content_rnn
         --checkpoint.opt = opt
         checkpoint.train_losses = train_losses
         checkpoint.val_loss = val_loss
         checkpoint.val_losses = val_losses
         checkpoint.i = i
         checkpoint.epoch = epoch
-        checkpoint.vocab = loader.vocab_mapping
+        checkpoint.vocab_mapping = loader.vocab_mapping
+        checkpoint.ans_mapping = loader.ans_mapping
         torch.save(savefile, checkpoint)
     end
 

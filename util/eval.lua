@@ -52,31 +52,37 @@ function eval.average_baseline(gold, mask)
     return eval.accuracy(pred, gold, mask)
 end
 
+function eval.get_one_payoff(my_buzz_pos, my_correct, human_buzz_pos, human_correct)
+    local my_payoff = 0
+    if human_buzz_pos < my_buzz_pos then
+        if human_correct then
+            my_payoff = my_payoff - 10
+        else
+            my_payoff = my_payoff + (my_correct and 15 or 5)
+        end
+    elseif human_buzz_pos > my_buzz_pos then
+        if my_correct then
+            my_payoff = my_payoff + 10
+        else
+            my_payoff = my_payoff - (human_correct and 15 or 5)
+        end
+    else
+        if my_correct then
+            my_payoff = my_payoff + (human_correct and 0 or 15)
+        else
+            my_payoff = my_payoff - (human_correct and 15 or 0) 
+        end
+    end 
+    return my_payoff
+end
+
 function eval.get_payoff(my_buzz_pos, my_correct, human_buzzes)
     local my_payoff = 0
     local total = 0
     for j=1,#human_buzzes do
         local human_buzz_pos = human_buzzes[j][2]
-        local human_correct = human_buzzes[j][3]
-        if human_buzz_pos < my_buzz_pos then
-            if human_correct == 1 then
-                my_payoff = my_payoff - 10
-            else
-                my_payoff = my_payoff + (my_correct == 1 and 15 or 5)
-            end
-        elseif human_buzz_pos > my_buzz_pos then
-            if my_correct == 1 then
-                my_payoff = my_payoff + 10
-            else
-                my_payoff = my_payoff - (human_correct == 1 and 15 or 5)
-            end
-        else
-            if my_correct == 1 then
-                my_payoff = my_payoff + (human_correct == 1 and 0 or 15)
-            else
-                my_payoff = my_payoff - (human_correct == 0 and 0 or 15) 
-            end
-        end  
+        local human_correct = human_buzzes[j][3] == 1 and true or false
+        my_payoff = my_payoff + eval.get_one_payoff(my_buzz_pos, my_correct, human_buzz_pos, human_correct)
         total = total + 1
     end
     return my_payoff, total
@@ -95,7 +101,7 @@ function eval.predicted_buzz(ans_preds, buzz_preds, gold, mask, qids, buzzes)
                     break
                 end
             end
-            local my_correct = ans_preds[i][my_buzz_pos] == gold[i][1] and 1 or 0
+            local my_correct = ans_preds[i][my_buzz_pos] == gold[i][1]
             local buzz = buzzes[qids[i]]
             if buzz ~= nil then
                 local payoff, tot = eval.get_payoff(my_buzz_pos, my_correct, buzz)
@@ -124,7 +130,7 @@ function eval.max_margin_buzz(logprobs, gold, mask, qids, buzzes)
     for i=1,logprobs:size(1) do
         if mask[i][1] > 0 then 
             local my_buzz_pos = buzz_pos[i][1]
-            local my_correct = sorted_ans[i][my_buzz_pos][1] == gold[i][1] and 1 or 0
+            local my_correct = sorted_ans[i][my_buzz_pos][1] == gold[i][1]
             local buzz = buzzes[qids[i]]
             if buzz ~= nil then
                 local payoff, tot = eval.get_payoff(my_buzz_pos, my_correct, buzz)
@@ -134,7 +140,35 @@ function eval.max_margin_buzz(logprobs, gold, mask, qids, buzzes)
             end
         end
     end
-    return my_payoff / total, buzz_pos_sum / total
+    -- no buzz data
+    if total == 0 then 
+        return -999, -999
+    else
+        return my_payoff / total, buzz_pos_sum / total
+    end
 end
 
+-- buzz at the given position
+function eval.static_buzz(buzz_position, ans_preds, gold, mask, qids, buzzes)
+    local my_payoff = 0
+    local total = 0
+    local my_buzz_pos = buzz_position
+    for i=1,ans_preds:size(1) do
+        if mask[i][1] > 0 then 
+            local my_correct = ans_preds[i][my_buzz_pos] == gold[i][1]
+            local buzz = buzzes[qids[i]]
+            if buzz ~= nil then
+                local payoff, tot = eval.get_payoff(my_buzz_pos, my_correct, buzz)
+                my_payoff = my_payoff + payoff
+                total = total + tot
+            end
+        end
+    end
+    -- no buzz data
+    if total == 0 then 
+        return -999, -999
+    else
+        return my_payoff / total, buzz_position
+    end
+end
 return eval

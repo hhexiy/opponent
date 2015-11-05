@@ -5,20 +5,6 @@ This file trains a quiz bowl player model.
 
 ]]--
 
-require 'torch'
-require 'nn'
-require 'nngraph'
-require 'optim'
-require 'lfs'
-
-require 'util.OneHot'
-require 'util.misc'
-local model_utils = require 'util.model_utils'
-local eval = require 'util.eval'
-include('model/RNNModel.lua')
-
-torch.setheaptracking(true)
-
 cmd = torch.CmdLine()
 cmd:text()
 cmd:text('Train a question-answering model')
@@ -30,8 +16,8 @@ cmd:option('-input_file','input.txt','data file name')
 -- model params
 cmd:option('-rnn_size', 128, 'size of LSTM internal state')
 cmd:option('-num_layers', 1, 'number of layers in the LSTM')
-cmd:option('-rnn', 'lstm', 'lstm, gru or rnn')
-cmd:option('-model', 'buzz_correct', 'buzz_correct')
+cmd:option('-rnn', 'gru', 'lstm, gru or rnn')
+cmd:option('-model', 'buzz_correct_rnn', 'buzz_correct')
 cmd:option('-embedding', 'dat/glove', 'directory of pretrained word embeddings')
 -- optimization
 cmd:option('-learning_rate',2e-3,'learning rate')
@@ -65,73 +51,12 @@ cmd:text()
 
 -- parse input params
 opt = cmd:parse(arg)
-torch.manualSeed(opt.seed)
-if opt.debug == 1 then nngraph.setDebug(true) end
 if opt.savefile == '' then opt.savefile = opt.model .. '_' .. opt.rnn end
 
--- initialize cunn/cutorch for training on the GPU and fall back to CPU gracefully
-if opt.gpuid >= 0 then
-    local ok, cunn = pcall(require, 'cunn')
-    local ok2, cutorch = pcall(require, 'cutorch')
-    if not ok then print('package cunn not found!') end
-    if not ok2 then print('package cutorch not found!') end
-    if ok and ok2 then
-        print('using CUDA on GPU ' .. opt.gpuid .. '...')
-        cutorch.setDevice(opt.gpuid + 1) -- note +1 to make it 0 indexed! sigh lua
-        cutorch.manualSeed(opt.seed)
-    else
-        print('If cutorch and cunn are installed, your CUDA toolkit may be improperly configured.')
-        print('Check your CUDA toolkit installation, rebuild cutorch and cunn, and try again.')
-        print('Falling back on CPU mode')
-        opt.gpuid = -1 -- overwrite user setting
-    end
-end
-
--- make sure output directory exists
-if not path.exists(opt.checkpoint_dir) then lfs.mkdir(opt.checkpoint_dir) end
-
-qb = {}
-include('model/QBModels.lua')
-include('util/MinibatchLoader.lua')
-
--- buzz class label
-qb.BUZZ, qb.WAIT, qb.EOS = 1, 2, 3
-
--- create the data loader class
-local loader = nil
-if opt.model == 'buzz_correct' then
-    loader = qb.QAMinibatchLoader(opt.data_dir, opt.input_file, opt.batch_size)
-end
-loader:load_data()
-qb.vocab_size = loader.vocab_size  
-qb.vocab = loader.vocab_mapping
-
--- word embedding
-if string.len(opt.embedding) > 0 then
-    qb.word_embedding = loader:load_embedding(opt.embedding)
-    qb.emb_size = qb.word_embedding.weight[1]:size(1)
-else
-    qb.word_embedding = nn.LookupTable(qb.vocab_size, 300) 
-    qb.emb_size = 300
-end
-print('word embedding size: ' .. qb.emb_size)
-
---qb.ans_size = loader.ans_size
-qb.ans_size = 793 
-qb.max_seq_length = loader.max_seq_length
-
-function load_model(path)
-    local checkpoint = torch.load(path)
-    local vocab_compatible = check_vocab_compatible(checkpoint.vocab, qb.vocab)
-    assert(vocab_compatible, 'error, the character vocabulary for this dataset and the one in the saved checkpoint are not the same. This is trouble.')
-    return checkpoint.rnn
-end
-
--- create content and buzz model
-print('loading content model from ' .. opt.init_content)
-local content_rnn = load_model(opt.init_content)
-content_rnn.net_params.batch_size = opt.batch_size
-local content_model = RNNModel(content_rnn, qb.max_seq_length, opt.gpuid, false)
+require 'setup'
+env_setup()
+local loader, content_model = qb_setup()
+local eval = require 'util.eval'
 
 local buzz_rnn, random_init
 if string.len(opt.init_from) > 0 then
@@ -140,8 +65,8 @@ if string.len(opt.init_from) > 0 then
     buzz_rnn.net_params.batch_size = opt.batch_size
     random_init = false
 else
-    if opt.model == 'buzz_correct' then
-        buzz_rnn = qb.BuzzCorrect(opt.rnn, opt.rnn_size, opt.num_layers, opt.batch_size, opt.dropout, true, 0.5)
+    if opt.model == 'buzz_correct_rnn' then
+        buzz_rnn = qb.BuzzCorrectRNN(opt.rnn, opt.rnn_size, opt.num_layers, opt.batch_size, opt.dropout, false, 0)
     end
     random_init = true
 end
@@ -183,12 +108,12 @@ function eval_split(split_index, max_batches)
         for t=1,seq_length do
             ans_logprob[t] = ans_logprob[t]:exp()
             ans_logprobs:sub(from, to, t, t, 1, -1):copy(ans_logprob[t])
-            buzz_feat:sub(1, -1, t, t, 1, -2):copy(ans_logprob[t])
+            buzz_feat:sub(1, -1, t, t, 1, -2):copy(ans_logprob[t]:clone():sort(2, true))
             buzz_feat:sub(1, -1, t, t, -1, -1):fill(t)
             local _, p = torch.max(ans_logprob[t], 2)
             p = p:type('torch.IntTensor'):squeeze(2)
             ans_preds:sub(from, to, t, t):copy(p)
-            local buzz_target = buzz_rnn:oracle_buzz(ans_logprob[t], y[{{}, t}], m[{{}, t}])
+            local buzz_target = buzz_rnn:oracle_buzz(ans_logprob[t], y[{{}, t}], m[{{}, t}], t)
             --local buzz_target = y[{{}, t}]
             buzz_targets:sub(from, to, t, t):copy(buzz_target)
         end
@@ -197,7 +122,13 @@ function eval_split(split_index, max_batches)
         --local buzz_logprob, _, bl = buzz_model:forward({ans_logprob, x}, buzz_targets:narrow(1, from, opt.batch_size), seq_length, true) 
         --buzz_feat:fill(7)
         --print(buzz_feat)
-        local buzz_logprob, _, bl = buzz_model:forward({buzz_feat, x}, buzz_targets:narrow(1, from, opt.batch_size), seq_length, true) 
+        local input
+        if buzz_rnn.use_words then 
+            input = {buzz_feat, x} 
+        else 
+            input = {buzz_feat}
+        end
+        local buzz_logprob, _, bl = buzz_model:forward(input, buzz_targets:narrow(1, from, opt.batch_size), seq_length, true) 
         buzz_loss = buzz_loss + bl
         for t=1,seq_length do
             local _, p = torch.max(buzz_logprob[t], 2)
@@ -244,17 +175,22 @@ function feval(x)
         --p = p:type('torch.IntTensor'):squeeze(2)
         --print(p)
         ans_logprob[t] = ans_logprob[t]:exp()
-        local buzz_target = buzz_rnn:oracle_buzz(ans_logprob[t], y[{{}, t}], m[{{}, t}])
+        local buzz_target = buzz_rnn:oracle_buzz(ans_logprob[t], y[{{}, t}], m[{{}, t}], t)
         --local buzz_target = y[{{}, t}]
         buzz_targets:narrow(2, t, 1):copy(buzz_target)
-        buzz_feat:sub(1, -1, t, t, 1, -2):copy(ans_logprob[t])
+        buzz_feat:sub(1, -1, t, t, 1, -2):copy(ans_logprob[t]:clone():sort(2, true))
         buzz_feat:sub(1, -1, t, t, -1, -1):fill(t)
     end
 
     -- run buzz model
     --local input = {ans_logprob, x}
     --buzz_feat:fill(7)
-    local input = {buzz_feat, x}
+    local input 
+    if buzz_rnn.use_words then
+        input = {buzz_feat, x}
+    else
+        input = {buzz_feat}
+    end
     local buzz_logprob, buzz_rnn_state, buzz_loss = buzz_model:forward(input, buzz_targets, seq_length) 
     --print(buzz_targets)
     --print('buzz:')

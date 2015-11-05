@@ -19,6 +19,8 @@ def clean_text(q):
     q = q.replace('~', '')
     q = q.replace('(*)', '')
     q = q.replace('*', '')
+    # sentence delimeter in qb2
+    q = q.replace(' ||| ', ' ')
     # don't remove BUZZ position
     q = re.sub(r'\[.*?BUZZ.*?\]', 'BUZZ', q)
     q = re.sub(r'\[.*?\]', '', q)
@@ -68,29 +70,163 @@ def assign_fold(probs, n):
     # probs = p(train), p(dev), p(test)
     # n = number of examples
     ntrain = int(probs[0] * n)
-    ndev = max(int(probs[1] * n), 1)
-    ntest = n - ntrain - ndev
-    if ntest == 0:
-        ntrain -= 1
-        ntest += 1
-    assert ntrain > 0 and ndev > 0 and ntest > 0
+    # no test data
+    if probs[2] == 0:
+        ntest = 0
+        if n < 2:
+            ntrain = 1
+            ndev = 0
+        else:
+            ndev = n - ntrain
+            if ndev == 0:
+                ntrain -= 1
+                ndev += 1
+            assert ntrain > 0 and ndev > 0
+    else:
+        if n < 3:
+            ntrain = 1
+            ntest = n - ntrain
+            ndev = 0
+        else:
+            ndev = max(int(probs[1] * n), 1)
+            ntest = n - ntrain - ndev
+            if ntest == 0:
+                ntrain -= 1
+                ntest += 1
+            assert ntrain > 0 and ndev > 0 and ntest > 0
     folds = ['train']*ntrain + ['dev']*ndev + ['test']*ntest
     random.shuffle(folds)
     return folds
 
+def load_buzzes(buzz_file, user_cutoff):
+    user_buzzes = defaultdict(dict)
+    with open(buzz_file, 'r') as fin:
+        for line in fin:
+            ss = line.split(',')
+            qid = ss[0]
+            uid = int(ss[1])
+            position = int(ss[2])
+            correct = int(ss[3])
+            # remove duplicated questions answered by the same user
+            # use the one with a later buzz
+            if qid not in user_buzzes[uid] or \
+                    position > user_buzzes[uid][qid][0]:
+                user_buzzes[uid][qid] = (position, correct)
+    print 'load buzzes from', buzz_file
+    print '#user,#q', len(user_buzzes), len(set([x for qlist in user_buzzes.values() for x in qlist]))
+
+    # filter buzzes
+    for uid, qdict in user_buzzes.items():
+        if len(qdict) < user_cutoff:
+            del user_buzzes[uid]
+    buzzes = defaultdict(list)
+    for uid, qdict in user_buzzes.items():
+        for qid, buzz in qdict.items():
+            position, correct = buzz
+            buzzes[qid].append([uid, position, correct])
+    print 'after removing users answered fewer than %d questions:' % user_cutoff
+    print '#user,#q,#buzz/q', len(user_buzzes), len(buzzes), sum([len(x) for x in buzzes.values()]) / float(len(buzzes))
+    return buzzes
+
+def load_questions(qfile, ans_cutoff):
+    questions = {}
+    ans_question = defaultdict(list)
+
+    with open(qfile, 'r') as fin:
+        # header
+        fields = {v: k for k, v in enumerate(fin.readline().strip().split(','))}
+        qid_field = fields['Question ID']
+        ans_field = fields['Wikipedia Page']
+        text_field = fields['Text']
+        reader = csv.reader(fin, delimiter=',')
+        for row in reader:
+            id_ = row[qid_field]
+            ans = row[ans_field]
+            text = row[text_field]
+            # remove too short questions
+            if len(text.split()) < 10:
+                continue
+            questions[id_] = [ans, text]
+            ans_question[ans].append(id_)
+    print 'load quesitons from', qfile
+    print '#ans,#q:', len(ans_question.keys()), len(questions)
+
+    # filter answers
+    for ans, q in ans_question.items():
+        if len(q) < ans_cutoff:
+            for qid in q:
+                if qid in questions:
+                    del questions[qid]
+            del ans_question[ans]
+    print 'after removing answers with fewer than %d questions:' % args.ans_cutoff
+    num_questions = sum([len(x) for x in ans_question.values()])
+    assert(len(questions) == num_questions)
+    print '#ans,#q:', len(ans_question.keys()), len(questions)
+
+    return questions, ans_question
+
+def split(ans_qids, probs, have_buzz=False):
+    fold_count = defaultdict(int)
+    users = defaultdict(set)
+    for ans, q in ans_qids.items():
+        folds = assign_fold(probs, len(q))
+        for qid, fold in izip(q, folds):
+            questions[qid].append(fold)
+            fold_count[fold] += 1
+            qtext = questions[qid][1].strip().lower()
+            if have_buzz:
+                # update buzz position relative to cleaned text
+                for i, buzz in enumerate(buzzes[qid]):
+                    uid, buzz_pos, correct = buzz
+                    users[fold].add(uid)
+                    new_buzz_pos = map_buzz_pos(buzz_pos, qtext)
+                    buzz[1] = new_buzz_pos
+                    assert(buzzes[qid][i][1] == new_buzz_pos)
+            questions[qid][1] = clean_text(qtext)
+            qlen = len(questions[qid][1].split())
+            for i, buzz in enumerate(buzzes[qid]):
+                assert buzz[1] <= qlen
+
+    # stats for train, dev, test
+    str_format = '{:<10}{:<10}{:<10}{:<10}'
+    print str_format.format('split', '#example', '#user', '#new')
+    for fold, count in fold_count.items():
+        if have_buzz:
+            nusers = len(users[fold])
+            nnew = nusers - len(users[fold].intersection(users['train']))
+        else:
+            nusers = '-'
+            nnew = '-'
+        print str_format.format(fold, count, nusers, nnew)
+
+def write_example(qids, output_file, have_buzz=False):
+    # sort questions by length (for minimum padding)
+    qids = sorted(qids, key=lambda i: len(questions[i][1].split()))
+    with open(output_file, 'w') as fout:
+        for qid in qids:
+            ans, qtext, fold = questions[qid]
+            if have_buzz:
+                buzz = '|'.join(['-'.join([str(x) for x in buzz]) for buzz in buzzes[qid]])
+                fout.write('%s\n' % (' ||| '.join([qid, ans, fold, qtext, buzz])))
+            else:
+                fout.write('%s\n' % (' ||| '.join([qid, ans, fold, qtext])))
+
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--buzz', help='buzzes.csv')
-    parser.add_argument('--question', help='questions.csv')
+    parser.add_argument('--question', help='question file')
     parser.add_argument('--users', help='file of user ids')
     parser.add_argument('--ners', help='file of ners (answers)')
-    parser.add_argument('--fake', action='store_true', help='generate artifical data')
-    parser.add_argument('--maxlen', type=int, default=10, help='generate artifical data')
     parser.add_argument('--ans_cutoff', type=int, default=10, help='remove answers who have fewer than 10 questions')
+    parser.add_argument('--ans_filter', help='a file of pre-selected answers: only keep questions with answers in this set')
     parser.add_argument('--user_cutoff', type=int, default=10, help='remove users who have answered fewer than 10 questions')
-    parser.add_argument('--train_frac', type=float, default=0.8, help='training fraction')
-    parser.add_argument('--dev_frac', type=float, default=0.1, help='validation fraction')
-    parser.add_argument('--output', help='path of output file')
+    parser.add_argument('--content_train_frac', type=float, default=0.8, help='training fraction')
+    parser.add_argument('--content_dev_frac', type=float, default=0.1, help='validation fraction')
+    parser.add_argument('--buzz_train_frac', type=float, default=0.8, help='training fraction')
+    parser.add_argument('--buzz_dev_frac', type=float, default=0.1, help='validation fraction')
+    parser.add_argument('--output_dir', help='path of output file')
     args = parser.parse_args()
     random.seed(100)
 
@@ -101,109 +237,44 @@ if __name__ == '__main__':
             ners = [l.strip().lower() for l in fin]
 
     # load questions
-    questions = {}
-    ans_question = defaultdict(list)
-    with open(args.question, 'r') as fin:
-        reader = csv.reader(fin, delimiter=',')
-        for row in reader:
-            id_ = int(row[0])
-            ans = row[1].lower().replace(' ', '_')
-            questions[id_] = [ans, row[4]]
-            # make sure that questions.csv has unique qids
-            ans_question[ans].append(id_)
-    print 'load quesitons from', args.question
-    print 'number of answers:', len(ans_question.keys())
-    print 'number of questions:', len(questions)
-
-    # filter answers
-    for ans, q in ans_question.items():
-        if len(q) < args.ans_cutoff:
-            for qid in q:
-                if qid in questions:
-                    del questions[qid]
-            del ans_question[ans]
-    num_questions = sum([len(x) for x in ans_question.values()])
-    assert(len(questions) == num_questions)
-    print 'after removing answers with fewer than %d questions:' % args.ans_cutoff
-    print 'number of answers:', len(ans_question.keys())
-    print 'number of questions:', num_questions
-
+    questions, ans_question = load_questions(args.question, args.ans_cutoff)
     # load buzzes
-    user_buzzes = defaultdict(dict)
-    with open(args.buzz, 'r') as fin:
-        for line in fin:
-            ss = line.split(',')
-            qid = int(ss[0])
-            uid = int(ss[1])
-            position = int(ss[2])
-            correct = int(ss[3])
-            # remove duplicated questions answered by the same user
-            # use the one with a later buzz
-            if qid not in user_buzzes[uid] or \
-                    position > user_buzzes[uid][qid][0]:
-                user_buzzes[uid][qid] = (position, correct)
-    print 'load buzzes from', args.buzz
-    print 'number of users:', len(user_buzzes)
-    print 'number of questions answered by at least one user:', len(set([x for qlist in user_buzzes.values() for x in qlist]))
+    buzzes = load_buzzes(args.buzz, args.user_cutoff)
 
-    # filter buzzes
-    for uid, qdict in user_buzzes.items():
-        if len(qdict) < args.user_cutoff:
-            del user_buzzes[uid]
-    buzzes = defaultdict(list)
-    for uid, qdict in user_buzzes.items():
-        for qid, buzz in qdict.items():
-            position, correct = buzz
-            buzzes[qid].append([uid, position, correct])
-    print 'after removing users answered fewer than %d questions:' % args.user_cutoff
-    print 'number of users:', len(user_buzzes)
-    print 'number of questions answered by at least one user:', len(buzzes)
-    print 'average user per question:', sum([len(x) for x in buzzes.values()]) / float(len(buzzes))
+    # filter ans based on buzz data
+    buzz_ans = set()
+    num_no_question = 0
+    for qid in buzzes:
+        if qid in questions:
+            buzz_ans.add(questions[qid][0])
+        else:
+            num_no_question += 1
+    print '%d answers with buzzes' % len(buzz_ans)
+    print '%d questions with buzzes does not have training data' % num_no_question
 
-    # split to train, dev, test
-    # make sure each answer has questions in each set
-    probs = [args.train_frac, args.dev_frac, 1.0-args.dev_frac-args.train_frac]
-    fold_count = defaultdict(int)
-    users = defaultdict(set)
-    for ans, q in ans_question.items():
-        folds = assign_fold(probs, len(q))
-        for qid, fold in izip(q, folds):
-            questions[qid].append(fold)
-            fold_count[fold] += 1
-            qtext = questions[qid][1].strip().lower()
-            # update buzz position relative to cleaned text
-            for i, buzz in enumerate(buzzes[qid]):
-                uid, buzz_pos, correct = buzz
-                users[fold].add(uid)
-                new_buzz_pos = map_buzz_pos(buzz_pos, qtext)
-                buzz[1] = new_buzz_pos
-                assert(buzzes[qid][i][1] == new_buzz_pos)
-            questions[qid][1] = clean_text(qtext)
-            qlen = len(questions[qid][1].split())
-            for i, buzz in enumerate(buzzes[qid]):
-                assert buzz[1] <= qlen
+    # collect content model and buzz model data
+    content_ans_qids = defaultdict(list)
+    buzz_ans_qids = defaultdict(list)
+    for ans in buzz_ans:
+        for qid in ans_question[ans]:
+            if qid in buzzes:
+                buzz_ans_qids[ans].append(qid)
+            else:
+                content_ans_qids[ans].append(qid)
+        # remove answers without additional question
+        if ans not in content_ans_qids:
+            del buzz_ans_qids[ans]
+    print 'content model #ans,#q', len(content_ans_qids), sum([len(x) for x in content_ans_qids.values()])
+    print 'buzz model #ans,#q', len(buzz_ans_qids), sum([len(x) for x in buzz_ans_qids.values()])
 
-    # stats for train, dev, test
-    str_format = '{:<10}{:<10}{:<10}{:<10}'
-    print str_format.format('split', '#example', '#user', '#new')
-    for fold, count in fold_count.items():
-        nusers = len(users[fold])
-        nnew = nusers - len(users[fold].intersection(users['train']))
-        print str_format.format(fold, count, nusers, nnew)
+    # process question text and assign folds
+    buzz_probs = [args.buzz_train_frac, args.buzz_dev_frac, 1.0-args.buzz_dev_frac-args.buzz_train_frac]
+    split(buzz_ans_qids, buzz_probs, True)
+    content_probs = [args.content_train_frac, args.content_dev_frac, 1.0-args.content_dev_frac-args.content_train_frac]
+    split(content_ans_qids, content_probs, False)
 
     # print
-    qids = questions.keys()
-    # sort questions by length (for minimum padding)
-    qids = sorted(qids, key=lambda i: len(questions[i][1].split()))
-    #random.shuffle(qids)
-    num_nobuzz = 0
-    with open(args.output, 'w') as fout:
-        for qid in qids:
-            ans, qtext, fold = questions[qid]
-            if len(buzzes[qid]) == 0:
-                num_nobuzz += 1
-            buzz = '|'.join(['-'.join([str(x) for x in buzz]) for buzz in buzzes[qid]])
-            fout.write('%d,%s,%s,%s,%s\n' % (qid, ans, fold, qtext, buzz))
-            #sys.stdout.write('%d,%s,%s,%s,%s\n' % (qid, ans, fold, qtext, buzz))
-            #break
-    print 'number of questions without buzz:', num_nobuzz
+    content_qids = [x for qlist in content_ans_qids.values() for x in qlist]
+    buzz_qids = [x for qlist in buzz_ans_qids.values() for x in qlist]
+    write_example(content_qids, args.output_dir+'/content_data.txt', False)
+    write_example(buzz_qids, args.output_dir+'/buzz_data.txt', True)
