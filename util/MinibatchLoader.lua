@@ -165,7 +165,9 @@ function QAMinibatchLoader:text_to_tensor(in_textfile, vocab_mapping, ans_mappin
     local user = {}
     local maxlen = 0
     local num_examples = 0
+    local num_buzzes = 0
     local split_sizes = {0, 0, 0}
+    local split_buzz_sizes = {0, 0, 0}
     while true do
         local line = f:read()
         if line == nil then break end
@@ -192,8 +194,9 @@ function QAMinibatchLoader:text_to_tensor(in_textfile, vocab_mapping, ans_mappin
             ans[ss[2]] = ans[ss[2]] + 1
         end
         -- user dict
+        local buzzes = {}
         if #ss > 4 then
-            local buzzes = string.split(ss[5], '|')
+            buzzes = string.split(ss[5], '|')
             for i, buzz in ipairs(buzzes) do
                 local ss = string.split(buzz, '-')
                 local uid = tonumber(ss[1]) -- user id
@@ -203,13 +206,17 @@ function QAMinibatchLoader:text_to_tensor(in_textfile, vocab_mapping, ans_mappin
         -- counts
         if ss[3] == 'train' then 
             split_sizes[1] = split_sizes[1] + 1
+            split_buzz_sizes[1] = split_buzz_sizes[1] + #buzzes
         elseif ss[3] == 'dev' then 
             split_sizes[2] = split_sizes[2] + 1
+            split_buzz_sizes[2] = split_buzz_sizes[2] + #buzzes
         else 
             split_sizes[3] = split_sizes[3] + 1
+            split_buzz_sizes[3] = split_buzz_sizes[3] + #buzzes
         end
         maxlen = math.max(maxlen, #toks)
         num_examples = num_examples + 1
+        num_buzzes = num_buzzes + #buzzes
     end
     f:close()
 
@@ -228,8 +235,10 @@ function QAMinibatchLoader:text_to_tensor(in_textfile, vocab_mapping, ans_mappin
     end
     self.user_size, self.user_mapping = self:create_mapping(user, {})
 
-    self.num_examples = split_sizes
-    print(string.format('# examples: %d(%d/%d/%d)', num_examples, split_sizes[1], split_sizes[2], split_sizes[3]))
+    self.num_questions = split_sizes
+    self.num_buzzes = split_buzz_sizes
+    print(string.format('# questions: %d(%d/%d/%d)', num_examples, split_sizes[1], split_sizes[2], split_sizes[3]))
+    print(string.format('# buzzes: %d(%d/%d/%d)', num_buzzes, split_buzz_sizes[1], split_buzz_sizes[2], split_buzz_sizes[3]))
     print('maximum sequence length: ' .. maxlen)
     self.max_seq_length = maxlen
     print('vocab size: ' .. self.vocab_size)

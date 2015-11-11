@@ -107,7 +107,9 @@ else
     qb.vocab_size = loader.vocab_size  
     qb.vocab_mapping = loader.vocab_mapping
     qb.ans_mapping = loader.ans_mapping
+    qb.ans_size = loader.ans_size
 end
+qb.vocab_size = loader.vocab_size  
 qb.ans_size = loader.ans_size
 qb.max_seq_length = loader.max_seq_length
 
@@ -171,6 +173,7 @@ function eval_split(split_index, max_batches)
     end
 
     ans_avg_acc = eval.accuracy(ans_preds, ans_targets, mask)
+    eval.all_accuracy(ans_preds, ans_targets, mask)
     ans_end_acc = eval.seq_accuracy(ans_preds, ans_targets, mask)
     ans_max_acc = eval.max_seq_accuracy(ans_preds, ans_targets, mask)
     mm_payoff, mm_mean_pos = eval.max_margin_buzz(ans_logprobs, ans_targets, mask, qids, loader.buzzes) 
@@ -203,7 +206,7 @@ end
 
 -- test only
 if opt.test == 1 then
-    local test_loss = eval_split(2)
+    local test_loss = eval_split(3)
     os.exit()
 end
 
