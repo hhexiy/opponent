@@ -11,7 +11,7 @@ require 'nngraph'
 require 'optim'
 require 'lfs'
 
-require 'util.OneHot'
+--require 'util.OneHot'
 require 'util.misc'
 local model_utils = require 'util.model_utils'
 local eval = require 'util.eval'
@@ -135,6 +135,9 @@ else
 end
 content_model = RNNModel(content_rnn, qb.max_seq_length, opt.gpuid, random_init)
 
+best_acc = nil
+best_model = nil
+
 -- evaluate the loss over an entire split
 function eval_split(split_index, max_batches)
     print('evaluating over split index ' .. split_index)
@@ -175,6 +178,10 @@ function eval_split(split_index, max_batches)
     ans_avg_acc = eval.accuracy(ans_preds, ans_targets, mask)
     eval.all_accuracy(ans_preds, ans_targets, mask)
     ans_end_acc = eval.seq_accuracy(ans_preds, ans_targets, mask)
+    if opt.test == 0 and (best_acc == nil or ans_end_acc > best_acc) then
+        print('new best model')
+        best_acc = ans_end_acc
+    end
     ans_max_acc = eval.max_seq_accuracy(ans_preds, ans_targets, mask)
     mm_payoff, mm_mean_pos = eval.max_margin_buzz(ans_logprobs, ans_targets, mask, qids, loader.buzzes) 
     ans_loss = ans_loss / n
@@ -206,7 +213,7 @@ end
 
 -- test only
 if opt.test == 1 then
-    local test_loss = eval_split(3)
+    local test_loss = eval_split(2)
     os.exit()
 end
 
@@ -242,6 +249,10 @@ for i = 1, iterations do
         end
     end
 
+    if i % opt.print_every == 0 then
+        print(string.format("%d/%d (epoch %.3f), train_loss = %6.8f, grad/param norm = %6.4e, time/batch = %.2fs", i, iterations, epoch, train_loss, content_model.grad_params:norm() / content_model.params:norm(), time))
+    end
+   
     -- every now and then or on last iteration
     if i % opt.eval_val_every == 0 or i == iterations then
         -- evaluate loss on validation data
@@ -263,10 +274,6 @@ for i = 1, iterations do
         torch.save(savefile, checkpoint)
     end
 
-    if i % opt.print_every == 0 then
-        print(string.format("%d/%d (epoch %.3f), train_loss = %6.8f, grad/param norm = %6.4e, time/batch = %.2fs", i, iterations, epoch, train_loss, content_model.grad_params:norm() / content_model.params:norm(), time))
-    end
-   
     if i % 10 == 0 then collectgarbage() end
 
     -- handle early stopping if things are going really bad

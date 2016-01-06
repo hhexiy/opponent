@@ -1,85 +1,68 @@
-# -*- coding: utf-8 -*-
 import argparse, csv, regex, re, sys
 from collections import defaultdict
 import random
 import numpy as np
 from itertools import izip
-import os.path
-import sqlite3
-from nltk.tokenize import sent_tokenize, word_tokenize
 
 def remove_punctuation(text):
     return regex.sub(ur"\p{P}+", " ", text)
 
 FTP = ' FTP '
-BUZZ = 'bbuuzz'
-ftp = ["for 10 points", "for ten points", 'ftp', 'for 15 points', '10 points']
+ftp = ["for 10 points", "for ten points", 'ftp']
 def clean_text(q):
     # remove pronunciation guides and other formatting extras
     q = q.replace(' (*) ', ' ')
-    q = q.replace('\n ', ' ')
-    q = q.replace('\\n ', ' ')
+    q = q.replace('\n', '')
     q = q.replace('mt. ', 'mt ')
     q = q.replace('{', '')
     q = q.replace('}', '')
     q = q.replace('~', '')
     q = q.replace('(*)', '')
     q = q.replace('*', '')
-    # utf8 punct to ascii
-    q = q.replace(u'“', '"')
-    q = q.replace(u'”', '"')
-    q = q.replace(u'‘', '"')
-    q = q.replace(u'’', '"')
-    q = q.replace(u'，', ',')
     # sentence delimeter in qb2
-    #q = q.replace(' ||| ', ' ')
+    q = q.replace(' ||| ', ' ')
     # don't remove BUZZ position
-    q = re.sub(r'\[[^\]]*%s[^\]]*\]' % BUZZ, BUZZ, q)
-    q = re.sub(r'\[[^\]]*\]', '', q)
-    q = re.sub(r'\([^\)]*%s[^\)]*\)' % BUZZ, BUZZ, q)
-    q = re.sub(r'\([^\)]*\)', '', q)
+    q = re.sub(r'\[.*?BUZZ.*?\]', 'BUZZ', q)
+    q = re.sub(r'\[.*?\]', '', q)
+    q = re.sub(r'\(.*?BUZZ.*?\)', 'BUZZ', q)
+    q = re.sub(r'\(.*?\)', '', q)
     q = re.sub(r'\?+', '', q)
-
-    ss = [' '.join(word_tokenize(s)) for s in sent_tokenize(q)]
-    q = ' '.join(ss)
-
-    q = re.sub(r'[ ]+', ' ', q).strip().lower()
 
     for phrase in ftp:
         q = q.replace(phrase, FTP)
-    return q
 
-class BuzzError(Exception):
-    pass
+    # remove punctuation
+    q = remove_punctuation(q)
+
+    # simple ner (replace answers w/ concatenated versions)
+    if ners:
+        for ner in ners:
+            q = q.replace(ner, ner.replace(' ', '_'))
+
+    q = re.sub(r'[ ]+', ' ', q).strip()
+
+    return q
 
 def map_buzz_pos(buzz_pos, q):
     '''
     map buzz pos relative to original text to cleaned text
     '''
-    words = q.split(' ')
+    words = q.split()
     # buzz_pos starts from 1
-    try:
-        words[buzz_pos-1] = '%s %s' % (words[buzz_pos-1], BUZZ)
-    except IndexError:
-        print 'q:', q
-        print 'buzz pos:', buzz_pos
-        print 'word:', len(words)
-        raise BuzzError
-    #    return 0
+    words[buzz_pos-1] = words[buzz_pos-1] + ' BUZZ'
     q = clean_text(' '.join(words))
     # get new buzz position
     ss = q.split()
     old_buzz_pos = buzz_pos
-    # buzz_pos starts from 1
     buzz_pos = None
     for i, s in enumerate(ss):
-        if s == BUZZ:
+        if s == 'BUZZ':
             buzz_pos = i
             break
     if buzz_pos is None:
-        print 'original:', old_buzz_pos, words
-        print 'cleaned:', q
-        raise BuzzError
+        print old_buzz_pos, q
+        print len(words), words
+        sys.exit()
     assert buzz_pos is not None
     return buzz_pos
 
@@ -118,18 +101,12 @@ def assign_fold(probs, n):
 def load_buzzes(buzz_file, user_cutoff):
     user_buzzes = defaultdict(dict)
     with open(buzz_file, 'r') as fin:
-        # header
-        fields = {v: k for k, v in enumerate(fin.readline().strip().split(','))}
-        qid_field = fields['Question ID']
-        uid_field = fields['User ID']
-        pos_field = fields['Buzz Position']
-        correct_field = fields['Correct']
-        reader = csv.reader(fin, delimiter=',')
-        for row in reader:
-            qid = int(row[qid_field])
-            uid = row[uid_field]
-            position = int(float(row[pos_field]))
-            correct = int(row[correct_field])
+        for line in fin:
+            ss = line.split(',')
+            qid = ss[0]
+            uid = int(ss[1])
+            position = int(ss[2])
+            correct = int(ss[3])
             # remove duplicated questions answered by the same user
             # use the one with a later buzz
             if qid not in user_buzzes[uid] or \
@@ -151,57 +128,6 @@ def load_buzzes(buzz_file, user_cutoff):
     print '#user,#q,#buzz/q', len(user_buzzes), len(buzzes), sum([len(x) for x in buzzes.values()]) / float(len(buzzes))
     return buzzes
 
-def get_col_names(c, table_name):
-    cols = {}
-    for row in c.execute('PRAGMA table_info(%s)' % table_name):
-        cols[row[1]] = row[0]
-    return cols
-
-def filter_answer(questions, ans_question, ans_cutoff):
-    for ans, q in ans_question.items():
-        if len(q) < ans_cutoff:
-            for qid in q:
-                if qid in questions:
-                    del questions[qid]
-            del ans_question[ans]
-    print 'after removing answers with fewer than %d questions:' % args.ans_cutoff
-    num_questions = sum([len(x) for x in ans_question.values()])
-    assert(len(questions) == num_questions)
-    print '#ans,#q:', len(ans_question.keys()), len(questions)
-    return questions, ans_question
-
-def load_questions_db(question_db, ans_cutoff):
-    questions = {}
-    ans_question = defaultdict(list)
-
-    assert os.path.isfile(question_db)
-    conn = sqlite3.connect(question_db)
-    c_q = conn.cursor()
-    c_t = conn.cursor()
-    questions_cols = get_col_names(c_q, 'questions')
-    text_cols = get_col_names(c_t, 'text')
-
-    for row_q in c_q.execute('select * from questions where page != ""'):
-        ans = row_q[questions_cols['page']]
-        # remove arithmetic questions
-        if '(number)' in ans:
-            continue
-        qid = row_q[questions_cols['id']]
-        category = row_q[questions_cols['category']]
-        sents = []
-        for row_t in c_t.execute('select * from text where question == %d' % qid):
-            sents.append(row_t[text_cols['raw']])
-        text = ' '.join(sents)
-        # remove too short questions
-        if qid in questions or len(text.split()) < 15:
-            continue
-        questions[qid] = [ans, text, category]
-        ans_question[ans].append(qid)
-    print 'load quesitons (db) from', question_db
-    print '#ans,#q:', len(ans_question.keys()), len(questions)
-
-    return filter_answer(questions, ans_question, ans_cutoff)
-
 def load_questions(qfile, ans_cutoff):
     questions = {}
     ans_question = defaultdict(list)
@@ -215,53 +141,53 @@ def load_questions(qfile, ans_cutoff):
         cat_field = fields['Category']
         reader = csv.reader(fin, delimiter=',')
         for row in reader:
-            id_ = int(row[qid_field])
+            id_ = row[qid_field]
             ans = row[ans_field]
             text = row[text_field]
-            text = text.replace(' ||| ', ' ')
             cat = row[cat_field]
             # remove too short questions
-            if id_ in questions or len(text.split()) < 10:
+            if len(text.split()) < 10:
                 continue
             questions[id_] = [ans, text, cat]
             ans_question[ans].append(id_)
     print 'load quesitons from', qfile
     print '#ans,#q:', len(ans_question.keys()), len(questions)
 
-    return filter_answer(questions, ans_question, ans_cutoff)
+    # filter answers
+    for ans, q in ans_question.items():
+        if len(q) < ans_cutoff:
+            for qid in q:
+                if qid in questions:
+                    del questions[qid]
+            del ans_question[ans]
+    print 'after removing answers with fewer than %d questions:' % args.ans_cutoff
+    num_questions = sum([len(x) for x in ans_question.values()])
+    assert(len(questions) == num_questions)
+    print '#ans,#q:', len(ans_question.keys()), len(questions)
+
+    return questions, ans_question
 
 def split(ans_qids, probs, have_buzz=False):
     fold_count = defaultdict(int)
     users = defaultdict(set)
-    num_buzzes = 0
-    sum_buzz_pos = 0
     for ans, q in ans_qids.items():
         folds = assign_fold(probs, len(q))
         for qid, fold in izip(q, folds):
             questions[qid].append(fold)
             fold_count[fold] += 1
-            qtext = questions[qid][1].strip()
+            qtext = questions[qid][1].strip().lower()
             if have_buzz:
                 # update buzz position relative to cleaned text
                 for i, buzz in enumerate(buzzes[qid]):
                     uid, buzz_pos, correct = buzz
                     users[fold].add(uid)
-                    try:
-                        new_buzz_pos = map_buzz_pos(buzz_pos, qtext)
-                    except BuzzError:
-                        print qid, uid
-                        sys.exit()
-                    sum_buzz_pos += new_buzz_pos
-                    num_buzzes += 1
+                    new_buzz_pos = map_buzz_pos(buzz_pos, qtext)
                     buzz[1] = new_buzz_pos
                     assert(buzzes[qid][i][1] == new_buzz_pos)
             questions[qid][1] = clean_text(qtext)
             qlen = len(questions[qid][1].split())
             for i, buzz in enumerate(buzzes[qid]):
                 assert buzz[1] <= qlen
-
-    if have_buzz:
-        print 'mean buzz position:', float(sum_buzz_pos) / num_buzzes
 
     # stats for train, dev, test
     str_format = '{:<10}{:<10}{:<10}{:<10}'
@@ -283,9 +209,9 @@ def write_example(qids, output_file, have_buzz=False):
             ans, qtext, cat, fold = questions[qid]
             if have_buzz:
                 buzz = '|'.join(['-'.join([str(x) for x in buzz]) for buzz in buzzes[qid]])
-                fout.write(('%s\n' % (' ||| '.join([str(qid), cat, ans, fold, qtext, buzz]))).encode('utf8'))
+                fout.write('%s\n' % (' ||| '.join([qid, cat, ans, fold, qtext, buzz])))
             else:
-                fout.write(('%s\n' % (' ||| '.join([str(qid), cat, ans, fold, qtext]))).encode('utf8'))
+                fout.write('%s\n' % (' ||| '.join([qid, cat, ans, fold, qtext])))
 
 
 
@@ -294,6 +220,7 @@ if __name__ == '__main__':
     parser.add_argument('--buzz', help='buzzes.csv')
     parser.add_argument('--question', help='question file')
     parser.add_argument('--users', help='file of user ids')
+    parser.add_argument('--ners', help='file of ners (answers)')
     parser.add_argument('--ans_cutoff', type=int, default=10, help='remove answers who have fewer than 10 questions')
     parser.add_argument('--ans_filter', help='a file of pre-selected answers: only keep questions with answers in this set')
     parser.add_argument('--user_cutoff', type=int, default=10, help='remove users who have answered fewer than 10 questions')
@@ -305,12 +232,14 @@ if __name__ == '__main__':
     args = parser.parse_args()
     random.seed(100)
 
-    # load questions
-    if args.question.endswith('.db'):
-        questions, ans_question = load_questions_db(args.question, args.ans_cutoff)
-    else:
-        questions, ans_question = load_questions(args.question, args.ans_cutoff)
+    # load ners
+    ners = []
+    if args.ners:
+        with open(args.ners, 'r') as fin:
+            ners = [l.strip().lower() for l in fin]
 
+    # load questions
+    questions, ans_question = load_questions(args.question, args.ans_cutoff)
     # load buzzes
     buzzes = load_buzzes(args.buzz, args.user_cutoff)
 

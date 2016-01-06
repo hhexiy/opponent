@@ -18,13 +18,14 @@ cmd:option('-batch_size',50,'number of questions to process in parallel')
 cmd:option('-embedding', '', 'directory of pretrained word embeddings')
 cmd:option('-init_content', '', 'pretrained content model parameters from checkpoint at this path')
 cmd:option('-hist_len', 1, 'history length of state features')
-cmd:option('-best', true, 'load best model or current model')
+cmd:option('-best', false, 'load best model or current model')
 cmd:option('-learning_rate_decay',0.97,'learning rate decay')
 cmd:option('-learning_rate_decay_after',20,'in number of epochs, when to start decaying the learning rate')
 -- dqn
 cmd:option('-framework', '', 'name of training framework')
 cmd:option('-env', '', 'name of environment to use')
 cmd:option('-simulate', 0, 'simulate players or not')
+cmd:option('-supervise', 0, 'using supervised signal as reward during training')
 cmd:option('-game_path', '', 'path to environment file (ROM)')
 cmd:option('-env_params', '', 'string of environment parameters')
 cmd:option('-pool_frms', '',
@@ -60,6 +61,7 @@ opt = cmd:parse(arg)
 -- dqn package use gpu
 opt.gpu = opt.gpuid
 if opt.savefile == '' then opt.savefile = opt.agent end
+opt.supervise = opt.supervise == 1 and true or false
 
 --- General env setup based on opt
 require 'setup'
@@ -96,7 +98,9 @@ local time_history = {}
 local v_history = {}
 local qmax_history = {}
 local td_history = {}
+-- this is just training reward
 local reward_history = {}
+local eval_reward_history = {}
 local step = 0
 time_history[1] = 0
 
@@ -157,7 +161,7 @@ function eval_split(split_index, test)
     eval_time = sys.clock() - eval_time
     total_reward = total_reward / nepisodes
     total_length = total_length / nepisodes
-    if game_env.num_player_groups then
+    if game_env.num_player_groups > 1 then
         for g=1,game_env.num_player_groups do
             group_reward[g] = group_reward[g] / group_nepisodes[g]
             group_length[g] = group_length[g] / group_nepisodes[g]
@@ -214,6 +218,12 @@ function eval_split(split_index, test)
                 game_env:report_error_analysis(g)
             end
         end
+        -- record eval reward history
+        if eval_reward_history[split_index] == nil then
+            eval_reward_history[split_index] = {}
+        end
+        local ind = #eval_reward_history[split_index] + 1
+        eval_reward_history[split_index][ind] = total_reward
     end
     print('=========================================')
 end
@@ -228,6 +238,7 @@ end
 -- use num_questions instead of num_buzzes because 
 -- only one buzz is sampled for each question during training
 local ntrain = game_env.num_questions[1]
+--local ntrain = game_env.num_buzzes[1]
 if opt.eval_freq == 0 then
     opt.eval_freq = ntrain
 end
@@ -252,9 +263,6 @@ for i=1,max_num_games do
     episode_reward = 0
     episode_length = 0
     nepisodes = nepisodes + 1
-    --if i == 3 then
-    --    os.exit()
-    --end
 
     -- progress report
     if i % opt.prog_freq == 0 then
@@ -280,8 +288,11 @@ for i=1,max_num_games do
     if i % opt.eval_freq == 0 then
         --game_env.debug = true
         eval_split(2)
-        eval_split(3, true)
+        --eval_split(3, true)
         --game_env.debug = false
+    end
+    if i % ntrain == 0 then
+        eval_split(3, true)
     end
 
     if i % opt.save_freq == 0 or i == max_num_games then
@@ -300,6 +311,7 @@ for i=1,max_num_games do
                                 model = agent.network,
                                 best_model = agent.best_network,
                                 reward_history = reward_history,
+                                eval_reward_history = eval_reward_history,
                                 reward_counts = reward_counts,
                                 episode_counts = episode_counts,
                                 time_history = time_history,

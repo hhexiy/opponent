@@ -128,21 +128,18 @@ end
 
 -- buzz at the most confident position
 function eval.max_margin_buzz(logprobs, gold, mask, qids, buzzes)
-    -- logprobs: size * seq_length * output_size
-    --local probs = logprobs:exp()
-    local sorted_probs, sorted_ans = torch.sort(logprobs, 3, true)
-    -- margin: size * seq_length
-    local margin = (sorted_probs:narrow(3, 1, 1) - sorted_probs:narrow(3, 2, 1)):squeeze(3)
-    assert(margin:lt(0):sum() == 0)
-    local _, buzz_pos = margin:max(2)
-
     local my_payoff = 0
     local total = 0
     local buzz_pos_sum = 0
     for i=1,logprobs:size(1) do
         if mask[i][1] > 0 then 
-            local my_buzz_pos = buzz_pos[i][1]
-            local my_correct = sorted_ans[i][my_buzz_pos][1] == gold[i][1]
+            -- logprobs: size * seq_length * output_size
+            local sorted_probs, sorted_ans = torch.sort(logprobs[i], 2, true)
+            local margin = (sorted_probs:narrow(2, 1, 1) - sorted_probs:narrow(2, 2, 1)):squeeze(2)
+            assert(margin:lt(0):sum() == 0)
+            local _, my_buzz_pos = margin:max(1)
+            my_buzz_pos = my_buzz_pos[1]
+            local my_correct = sorted_ans[my_buzz_pos][1] == gold[i][1]
             local buzz = buzzes[qids[i]]
             if buzz ~= nil then
                 local payoff, tot = eval.get_payoff(my_buzz_pos, my_correct, buzz)

@@ -35,6 +35,7 @@ cmd:option('-val_frac',0.05,'fraction of data that goes into validation set')
             -- test_frac will be computed as (1 - train_frac - val_frac)
 cmd:option('-init_from', '', 'initialize network parameters from checkpoint at this path')
 cmd:option('-init_content', '', 'pretrained content model parameters from checkpoint at this path')
+cmd:option('-best', false, 'load best model or current model')
 -- bookkeeping
 cmd:option('-seed',123,'torch manual random number generator seed')
 cmd:option('-print_every',1,'how many steps/minibatches between printing out the loss')
@@ -43,6 +44,7 @@ cmd:option('-checkpoint_dir', '/fs/clip-scratch/hhe/opponent/cv', 'output direct
 cmd:option('-savefile','','filename to autosave the checkpont to. Will be inside checkpoint_dir/')
 -- GPU/CPU
 cmd:option('-gpuid',0,'which gpu to use. -1 = use CPU')
+cmd:option('-threads', 0, 'number of BLAS threads')
 -- debug
 cmd:option('-debug',0,'debug mode: printouts and assertions')
 -- test
@@ -57,11 +59,13 @@ require 'setup'
 env_setup()
 local loader, content_model = qb_setup()
 local eval = require 'util.eval'
+local best_loss = nil
 
 local buzz_rnn, random_init
 if string.len(opt.init_from) > 0 then
     print('loading buzz model from ' .. opt.init_from)
-    buzz_rnn = load_model(opt.init_from)
+    checkpoint = load_model(opt.init_from)
+    buzz_rnn = checkpoint.rnn
     buzz_rnn.net_params.batch_size = opt.batch_size
     random_init = false
 else
@@ -146,6 +150,10 @@ function eval_split(split_index, max_batches)
     --ans_max_acc = eval.max_seq_accuracy(ans_preds, ans_targets, mask)
     mm_payoff, mm_mean_pos = eval.max_margin_buzz(ans_logprobs, ans_targets, mask, qids, loader.buzzes) 
     pred_payoff, pred_mean_pos = eval.predicted_buzz(ans_preds, buzz_preds, ans_targets, mask, qids, loader.buzzes) 
+    if opt.test == 0 and split_index == 2 and (best_reward == nil or pred_payoff > best_reward) then
+        print('new best model on dev set')
+        best_reward = pred_payoff
+    end
     oracle_payoff, oracle_mean_pos = eval.predicted_buzz(ans_preds, buzz_targets, ans_targets, mask, qids, loader.buzzes) 
     ans_loss = ans_loss / n
     buzz_loss = buzz_loss / n
@@ -259,12 +267,13 @@ for i = 1, iterations do
     if i % opt.eval_val_every == 0 or i == iterations then
         -- evaluate loss on validation data
         local val_loss = eval_split(2) -- 2 = validation
+        eval_split(3)
         val_losses[i] = val_loss
 
         local savefile = string.format('%s/%s_epoch%.2f_%.4f.t7', opt.checkpoint_dir, opt.savefile, epoch, val_loss)
         print('saving checkpoint to ' .. savefile)
         local checkpoint = {}
-        checkpoint.rnn = rnn
+        checkpoint.rnn = buzz_rnn
         --checkpoint.opt = opt
         checkpoint.train_losses = train_losses
         checkpoint.val_loss = val_loss

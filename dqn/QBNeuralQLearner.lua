@@ -416,11 +416,11 @@ function nql:greedy(state)
     return besta[r]
 end
 
-
+-- fully connected
 function nql:createNetwork()
     local n_hid = 128
     local mlp = nn.Sequential()
-    mlp:add(nn.Linear(self.state_dim, n_hid))
+    mlp:add(nn.Linear(self.feat_groups.pred.size, n_hid))
     mlp:add(nn.Rectifier())
     mlp:add(nn.Linear(n_hid, n_hid))
     mlp:add(nn.Rectifier())
@@ -429,58 +429,29 @@ function nql:createNetwork()
     return mlp
 end
 
-function nql:state_to_input(state)
-    return state
-    --return state:narrow(2, self.feat_groups.default.offset, self.feat_groups.default.size)
-            --state:select(2, self.feat_groups.pred.offset)
-        
-end
-
 function nql:createNetwork2()
     local n_hid = 128
-    local pred_nhid = 50
-    local inputs = {}
-    table.insert(inputs, nn.Identity()())
-    --table.insert(inputs, nn.Identity()())
-    --local pred_emb = nn.LookupTable(self.ans_size, pred_nhid)(inputs[2])
-    --local join = nn.JoinTable(2)({inputs[1], pred_emb})
-    --local h = nn.Linear(self.feat_groups.default.size+pred_nhid, n_hid)(join)
-    local h = nn.Linear(self.feat_groups.default.size, n_hid)(inputs[1])
-    h = nn.Rectifier()(h)
-    h = nn.Rectifier()(nn.Linear(n_hid, n_hid)(h))
-    local logsoft = nn.LogSoftMax()(nn.Linear(n_hid, self.n_actions)(h))
-    local outputs = {}
-    table.insert(outputs, logsoft)
-    return nn.gModule(inputs, outputs)
-end
-
-function nql:createNetwork2()
-    local n_hid = 128
-    local mlp = nn.Sequential()
-    -- get different parts of the input
-    local concat = nn.ConcatTable()
-    concat:add(nn.Narrow(2, self.feat_groups.default.offset, self.feat_groups.default.size))
-    --concat:add(nn.Narrow(2, self.feat_groups.pred.offset, self.feat_groups.pred.size))
-    concat:add(nn.Select(2, self.feat_groups.pred.offset))
-    mlp:add(concat)
-    -- transformation for each group
     local parallel = nn.ParallelTable()
+    local mlp = nn.Sequential()
+    local mlp_pred = nn.Sequential()
+    mlp_pred:add(nn.Linear(self.feat_groups.pred.size, n_hid))
+    mlp_pred:add(nn.Rectifier())
+    parallel:add(mlp_pred)
     parallel:add(nn.Identity())
-    local pred_nhid = 50
-    --local pred_mlp = nn.Sequential()
-    --pred_mlp:add(MultiHot(self.ans_size))
-    --pred_mlp:add(nn.Linear(self.ans_size, pred_nhid))
-    --parallel:add(pred_mlp)
-    parallel:add(nn.LookupTable(self.ans_size, pred_nhid))
     mlp:add(parallel)
-    -- join two parts
     mlp:add(nn.JoinTable(2))
-    mlp:add(nn.Linear(self.feat_groups.default.size+pred_nhid, n_hid))
-    --mlp:add(nn.Rectifier())
-    --mlp:add(nn.Linear(n_hid, n_hid))
+    mlp:add(nn.Linear(n_hid+self.feat_groups.state.size, n_hid))
     mlp:add(nn.Rectifier())
     mlp:add(nn.Linear(n_hid, self.n_actions))
     return mlp
+end
+
+function nql:state_to_input(state)
+    --return state
+    return state:narrow(2, self.feat_groups.pred.offset, self.feat_groups.pred.size)
+    --return {state:narrow(2, self.feat_groups.pred.offset, self.feat_groups.pred.size),
+    --        state:narrow(2, self.feat_groups.state.offset, self.feat_groups.state.size)
+    --    }
 end
 
 

@@ -1,13 +1,17 @@
 local QBFramework = torch.class('qb.Framework')
 
-function QBFramework:__init(loader, content_model, hist_len, agent_type, simulate)
+function QBFramework:__init(loader, content_model, args)
     self.loader = loader
     self.content_model = content_model
+    -- TODO: calculate this
+    self.ans_state_size = self.content_model.net_params.rnn_size
     self.actions = {qb.BUZZ, qb.WAIT}
-    self.hist_len = hist_len or 1
+    self.hist_len = args.hist_len or 1
+    self.cat_size = self.loader.cat_size  -- number of categories
     -- mode
     self.debug = false
-    self.simulate = simulate or 0
+    self.simulate = args.simulate or 0
+    self.supervise = args.supervise or false  
     -- number of questions in each split
     self.num_questions = loader.num_questions
     -- number of buzzes in each split
@@ -19,6 +23,9 @@ function QBFramework:__init(loader, content_model, hist_len, agent_type, simulat
     else
         self.num_buzzes = loader.num_buzzes
     end
+    -- user stats
+    self.user_stats = loader.user_stats
+    self.num_users = loader.user_size
     -- game batch
     self.game_pointer = 0
     self.batch_ans_probs = nil
@@ -27,6 +34,7 @@ function QBFramework:__init(loader, content_model, hist_len, agent_type, simulat
     self.batch_qids = nil
     self.batch_size = 0
     -- current game
+    self.category = nil
     self.buzz_pointer = 0   -- for iterating through buzzes
     self.buzzes = {}
     self.ans_prob = nil 
@@ -46,7 +54,7 @@ function QBFramework:__init(loader, content_model, hist_len, agent_type, simulat
     self.get_state = self.get_state_test
     self.feat_groups = nil
     self.topk = 1   -- include topk ans preds in feature
-    self:set_feat_map(agent_type)
+    self:set_feat_map(args.agent)
     -- error analysis
     self.buzz_early_correct = torch.zeros(self.num_player_groups)
     self.buzz_early_wrong = torch.zeros(self.num_player_groups)
@@ -103,26 +111,34 @@ function QBFramework:get_feat_groups()
 end
 
 function QBFramework:set_feat_map(agent_type)
-    -- default network
-    -- TODO: don't need the function 
-    local state_dim_default = self.hist_len*qb.ans_size + 1
-    local feat_groups_default = {default={offset=1, size=state_dim_default}}
+    -- default network features: prediction, position, rnn state
+    --local state_dim_default = self.hist_len*qb.ans_size + 1 + self.ans_state_size 
+    local state_dim_default = self.hist_len*qb.ans_size + 1 + 3
+    local feat_groups_default = {pred={offset=1, size=self.hist_len*qb.ans_size + 1 + 3}}
+    --feat_groups_default.state = {offset=feat_groups_default.pred.size+1, size=self.ans_state_size}
+    self.feat_groups = feat_groups_default
     if agent_type == 'QBNeuralQLearner' then
         self._fill_state = self._fill_default
         self.state_dim = state_dim_default 
-        self.feat_groups = feat_groups_default
     -- QB+OpponentId
     -- TODO: fix state_dim
-    elseif agent_type == 'QBONeuralQLearner1' or agent_type == 'QBONeuralQLearner2' then
-        self._fill_state = self._fill_opponent_id
-        self.state_dim = self:_state_dim_default() + 1
-        self.feat_groups = {default={offset=1, size=self.state_dim-1},
-                            id={offset=self.state_dim, size=1}}
+    elseif agent_type == 'QBONeuralQLearner' then
+        self._fill_state = self._fill_opponent
+        --self.state_dim = state_dim_default + 3 + self.ans_state_size
+        --self.feat_groups.opponent = {offset=state_dim_default+1, size=3+self.ans_state_size}
+        local opp_size = 4
+        self.state_dim = state_dim_default + opp_size
+        self.feat_groups.opponent = {offset=state_dim_default+1, size=opp_size}
     elseif agent_type == 'QBONeuralQLearner_cheat' then
         self._fill_state = self._fill_cheat
-        self.state_dim = state_dim_default + 3
-        feat_groups_default.cheat = {offset=state_dim_default+1, size=3}
-        self.feat_groups = feat_groups_default
+        local cheat_size = self.num_player_groups
+        self.state_dim = state_dim_default + cheat_size
+        self.feat_groups.cheat = {offset=state_dim_default+1, size=cheat_size}
+    end
+    if self.supervise then
+        self._fill_state = self._fill_supervised
+        self.state_dim = state_dim_default - 3
+        self.feat_groups = {pred={offset=1, size=self.hist_len*qb.ans_size + 1}}
     end
 end
 
@@ -136,25 +152,42 @@ end
 
 function QBFramework:_fill_cheat(t, state, from)
     from = self:_fill_default(t, state, from)
+    -- player group
+    state[from+self.player_group-1] = 1
     -- if the player will buzz next
     --if self.player_buzz_pos == t + 1 then
-    state[from] = t / self.player_buzz_pos
-    --state[from+1] = self.player_correct and 1 or 0
+    --state[from] = t / self.player_buzz_pos
+    --state[from+1] = self.player_correct and t / self.player_buzz_pos or 0
     --state[from+2] = self.ans_pred(t)[1] == self.ans_target and 1 or 0
     --end
-    from = from + 3
+    from = from + self.num_player_groups
     return from
 end
 
-function QBFramework:_fill_opponent_id(t, state, from)
+function QBFramework:_fill_opponent(t, state, from)
     from = self:_fill_default(t, state, from)
-    state[from] = self.player_id 
+    state:sub(from, from+2):copy(self.user_stats[self.player_id])
+    from = from + 3
+    state[from] = t/300
+    from = from + 1
+    --state:narrow(1, from, self.ans_state_size):copy(self.ans_state(t))
+    --from = from + self.ans_state_size
+    --state[from+self.player_id-1] = 1
+    --from = from + self.num_users
+    return from
+end
+
+function QBFramework:_fill_supervised(t, state, from)
+    for i=t,t-self.hist_len+1,-1 do
+        if i > 0 then
+            state:narrow(1, from, qb.ans_size):copy(self.ans_prob(i))
+        end
+        from = from + qb.ans_size
+    end
+    -- normalization for t 
+    state[from] = t/300
     from = from + 1
     return from
-end
-
-function QBFramework:_state_dim_default()
-    return self.hist_len*qb.ans_size + 1 + self.topk
 end
 
 function QBFramework:_fill_default(t, state, from)
@@ -167,10 +200,28 @@ function QBFramework:_fill_default(t, state, from)
     -- normalization for t 
     state[from] = t/300
     from = from + 1
+    if self.player_buzzed then
+        if self.player_correct then
+            state[from] = 1
+        else
+            state[from+1] = 1
+        end
+    else
+        state[from+2] = 1
+    end
+    from = from + 3
+    -- hiddent state of content
+    --state:narrow(1, from, self.ans_state_size):copy(self.ans_state(t))
+    --from = from + self.ans_state_size
+    -- category 
+    --state[from+self.category-1] = 1
+    --from = from + self.cat_size 
     -- top-k predictions
     --local k = self.topk
     --state:narrow(1, from, k):copy(self.ans_pred(t):narrow(1, 1, k))
     --from = from + k
+    --state[from+self.ans_pred(t)-1] = 1
+    --from = from + qb.ans_size
     return from
 end
 
@@ -184,10 +235,25 @@ end
 function QBFramework:new_game(split_index, test)
     self.split_index = split_index or 1
     self.test = test or false
+    if not self.test then
+        if self.supervise then
+            self.get_state = self.get_state_oracle
+        else
+            self.get_state = self.get_state_train
+        end
+    else
+        self.get_state = self.get_state_test
+    end
     self:load_next_buzz()
+    --if not self.test then
+    --    while self.player_group ~= 3 do
+    --        self:load_next_buzz()
+    --    end
+    --end
     -- starting state is the first word
     self.step_count = 1
     self.buzzed = false
+    self.player_buzzed = false
     if self.debug then 
         print(string.format('ans=%d, max_step=%d, player_id=%d, player_buzz_pos=%d, player_correct=%s', self.ans_target, self.max_step, self.player_id, self.player_buzz_pos, self.player_correct))
     end
@@ -203,16 +269,21 @@ function QBFramework:load_next_batch()
     local ans_logprob, ans_rnn_state, _ = self.content_model:forward({x}, y, seq_length, true)
     self.batch_ans_probs = {}
     self.batch_ans_preds = {}
+    self.batch_ans_states = {}
     for t=1,seq_length do
         _, self.batch_ans_preds[t] = torch.max(ans_logprob[t], 2)
         -- NOTE: must squeeze! otherwize ans_preds(t) is a tensor instead of a number.
         self.batch_ans_preds[t] = self.batch_ans_preds[t]:squeeze(2)
         self.batch_ans_probs[t] = ans_logprob[t]:exp():sort(2, true)
+        local num_states = #ans_rnn_state[t]
+        self.batch_ans_states[t] = ans_rnn_state[t][num_states]
     end
     self.batch_ans_targets = y
     self.batch_masks = m
-    self.game_pointer = 0
-    self.batch_size = m:narrow(2, 1, 1):sum()
+    self.batch_size = m:size(1) 
+    local true_batch_size = m:narrow(2, 1, 1):sum()
+    -- skip examples padded at the beginning
+    self.game_pointer = self.batch_size - true_batch_size
     self.batch_qids = qids
 end
 
@@ -224,13 +295,16 @@ function QBFramework:load_next_question()
     if self.debug then print(string.format('-------- game %s --------', self.batch_qids[self.game_pointer])) end
     self.ans_prob = function (t) return self.batch_ans_probs[t][self.game_pointer] end
     self.ans_pred = function (t) return self.batch_ans_preds[t][self.game_pointer] end
+    self.ans_state = function (t) return self.batch_ans_states[t][self.game_pointer] end
     self.ans_target = self.batch_ans_targets[self.game_pointer][1] 
     self.max_step = self.batch_masks[self.game_pointer]:sum()
+    local qid = self.batch_qids[self.game_pointer]
+    self.category = self.loader.categories[qid]
     if self.simulate > 0 then
         local buzz_pos = torch.Tensor({0.6, 0.9})
         self.buzzes = self:simulate_buzzes(self.simulate, buzz_pos, self.max_step)
     else
-        self.buzzes = self.loader.buzzes[self.batch_qids[self.game_pointer]]
+        self.buzzes = self.loader.buzzes[qid]
     end
     assert(#self.buzzes > 0)
     self.buzz_pointer = 0
@@ -280,6 +354,7 @@ function QBFramework:_bin_player(buzz_pos)
             return i-1
         end
     end
+    print(self.player_buzz_pos, self.max_step)
     error('cannot bin player ' .. buzz_pos)
 end
 
@@ -301,15 +376,15 @@ function QBFramework:get_state_oracle()
         local correct = self.ans_pred(self.step_count - 1) == self.ans_target
         if correct then
             if self.buzzed then
-                reward = 1
+                reward = 10
             else
-                reward = -1
+                reward = -10
             end
         else
             if self.buzzed then
-                reward = -5
+                reward = -15
             else
-                reward = 1
+                reward = 15
             end
         end
     end
@@ -320,9 +395,8 @@ function QBFramework:get_state_oracle()
         terminal = false
     end
 
-    local correct = terminal and 0 or (self.ans_pred(self.step_count) == self.ans_target and 1 or -1)
-
     if self.debug then
+        local correct = terminal and 0 or (self.ans_pred(self.step_count) == self.ans_target and 1 or -1)
         print(string.format('%s at %d. Correct %d. Reward %d.', self.buzzed and 'Buzzed' or 'Wait', self.step_count-1, correct, reward))
     end
 
@@ -335,15 +409,17 @@ function QBFramework:get_state_oracle()
     return state, terminal, reward
 end
 
+-- TODO: don't terminate until the end
+-- TODO: recored buzzing position without player terminating
 -- use actual reward in quizbowl
 function QBFramework:get_state_test()
     -- agent cannot take any action in terminal states
     local terminal, reward, state
     if self.buzzed then
-        local buzz_pos = self.step_count - 1
+        local buzz_pos = self.step_count - 1 
+        local correct = self.ans_pred(buzz_pos) == self.ans_target
         assert(buzz_pos <= self.player_buzz_pos or not self.player_correct)
         terminal = true
-        local correct = self.ans_pred(buzz_pos) == self.ans_target
         if buzz_pos <= self.player_buzz_pos then
             if correct then
                 self.buzz_early_correct[self.player_group] = self.buzz_early_correct[self.player_group] + 1
@@ -358,16 +434,11 @@ function QBFramework:get_state_test()
             end
         end
         reward = qb.eval.get_one_payoff(buzz_pos, correct, self.player_buzz_pos, self.player_correct)
-        -- adjust reward during training to encourage buzzing at high confidence
-        if not self.test then
-            if correct then
-                reward = reward * self.ans_prob(buzz_pos)[self.ans_target] * 5
-            end
-        end
         if self.debug then
             print(string.format('Buzzed at %d. %s. Reward %d.', buzz_pos, correct and 'Correct' or 'Wrong', reward))
         end
     elseif self.step_count > self.player_buzz_pos then
+        self.player_buzzed = true
         if self.player_correct then
             terminal = true
             reward = -10
@@ -421,3 +492,71 @@ function QBFramework:get_state_test()
     return state, terminal, reward
 end
 
+function QBFramework:get_state_train()
+    -- agent cannot take any action in terminal states
+    local terminal, reward, state
+    if self.buzzed then
+        local buzz_pos = self.step_count - 1 
+        local correct = self.ans_pred(buzz_pos) == self.ans_target
+        assert(buzz_pos <= self.player_buzz_pos or not self.player_correct)
+        terminal = true
+        reward = qb.eval.get_one_payoff(buzz_pos, correct, self.player_buzz_pos, self.player_correct)
+        -- adjust reward during training to encourage buzzing at high confidence
+        --if correct then
+        --    reward = reward * self.ans_prob(buzz_pos)[self.ans_target] * 5
+        --end
+        if self.debug then
+            print(string.format('Buzzed at %d. %s. Reward %d.', buzz_pos, correct and 'Correct' or 'Wrong', reward))
+        end
+    elseif self.step_count > self.player_buzz_pos then
+        self.player_buzzed = true
+        if self.player_correct then
+            terminal = true
+            reward = -10
+            if self.debug then
+                print(string.format('Player buzzed. Reward -10.'))
+            end
+        elseif self.step_count <= self.max_step then
+            terminal = false
+            local correct = self.ans_pred(self.step_count-1) == self.ans_target
+            if correct then
+                reward = -1
+            else
+                reward = 1
+            end
+            if self.debug then
+                print(string.format('Player buzzed wrong. Waiting. Reward 0.'))
+            end
+        else
+            error('agent should always buzz at the final word')
+        end
+    else
+        terminal = false
+        if self.step_count == 1 then
+            reward = 0
+        else
+            local correct = self.ans_pred(self.step_count-1) == self.ans_target
+            if correct then
+                reward = -1
+            else
+                reward = 1
+            end
+        end
+        if self.debug then
+            print(string.format('No one buzzed yet. Reward 0.'))
+        end
+    end
+    if self.debug then
+        print(string.format('At word %d. terminal=%s', self.step_count, terminal))
+        if terminal then print ('---------------------------') end
+    end
+
+    if self.debug then
+        local correct = terminal and 0 or (self.ans_pred(self.step_count) == self.ans_target and 1 or -1)
+        print('correct: ' .. correct)
+    end
+
+    local t = math.min(self.step_count, self.max_step)
+    state = self:state_feat(t)
+    return state, terminal, reward
+end
