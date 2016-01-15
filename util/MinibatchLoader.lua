@@ -106,7 +106,7 @@ function MinibatchLoader:filter_vocab(vocab, cutoff)
     return vocab
 end
 
-function MinibatchLoader:load_embedding(emb_dir)
+function MinibatchLoader:load_embedding(emb_dir, pad)
     print('loading embedding from ' .. emb_dir)
     -- read embedding vocabulary
     local f = io.open(emb_dir .. '/vocab.txt', 'r')
@@ -127,7 +127,12 @@ function MinibatchLoader:load_embedding(emb_dir)
     -- embedding layer
     print('creating LookupTable...')
     local num_unks = 0
-    local emb = nn.LookupTable(self.vocab_size, emb_size)
+    local emb
+    if pad ~= nil then
+        emb = nn.MaskedLookupTable(self.vocab_size, emb_size, pad)
+    else
+        emb = nn.LookupTable(self.vocab_size, emb_size)
+    end
     for tok, i in pairs(self.vocab_mapping) do
         -- word without pretrained embedding
         if not emb_vocab[tok] then
@@ -413,18 +418,22 @@ function QAMinibatchLoader:text_to_tensor(in_textfile, vocab_mapping, ans_mappin
         cat_counts[cat] = cat_counts[cat] + 1
     end
     local sorted_cat_counts, sorted_cats = torch.sort(cat_counts, 1, true)
-    local topk_cats = 0
+    local topk_cats = 10
     local top_cats = {}
-    print('top categories:')
+    --print('top categories:')
+    --local r_cat_mapping = {}
+    --for k, v in pairs(self.cat_mapping) do r_cat_mapping[v]=k end
     for i=1,topk_cats do 
-        print(self.cat_mapping[sorted_cats[i]])
+        --print(r_cat_mapping[sorted_cats[i]], sorted_cat_counts[i])
         top_cats[sorted_cats[i]] = i
     end
+    self.top_cats = top_cats
+    self.topk_cats = topk_cats
 
     -- user stats on training set
     -- uid has been mapped
     -- TODO: topk cats
-    self.user_stats = torch.FloatTensor(self.user_size, 3*(topk_cats+1)):zero()
+    self.user_stats = torch.FloatTensor(self.user_size, 3*(topk_cats+2)):zero()
     local questions = self.questions[1]
     for i=1,questions:size(1) do
         local qid = questions[i][1]
@@ -439,19 +448,22 @@ function QAMinibatchLoader:text_to_tensor(in_textfile, vocab_mapping, ans_mappin
             self.user_stats[uid][2] = self.user_stats[uid][2] + buzz_pos / qlen
             self.user_stats[uid][3] = self.user_stats[uid][3] + correct 
             -- number of questions answered of one category
+            local offset
             if top_cats[qcat] ~= nil then
-                local offset = top_cats[qcat]*3
-                self.user_stats[uid][offset+1] = self.user_stats[uid][offset+1] + 1
-                self.user_stats[uid][offset+2] = self.user_stats[uid][offset+2] + buzz_pos / qlen
-                self.user_stats[uid][offset+3] = self.user_stats[uid][offset+3] + correct 
+                offset = top_cats[qcat]*3
+            else
+                offset = (topk_cats+1)*3  -- other
             end
+            self.user_stats[uid][offset+1] = self.user_stats[uid][offset+1] + 1
+            self.user_stats[uid][offset+2] = self.user_stats[uid][offset+2] + buzz_pos / qlen
+            self.user_stats[uid][offset+3] = self.user_stats[uid][offset+3] + correct 
         end
     end
     -- get mean
     self.user_stats[{{},2}]:cdiv(self.user_stats[{{},1}])
     self.user_stats[{{},3}]:cdiv(self.user_stats[{{},1}])
     self.user_stats[{{},1}]:div(self.num_questions[1])
-    for i=1,topk_cats do
+    for i=1,topk_cats+1 do
         local offset = i*3
         local ind = self.user_stats[{{},offset+1}]:gt(0)
         self.user_stats[{{},offset+2}][ind] = self.user_stats[{{},offset+2}][ind]:cdiv(self.user_stats[{{},offset+1}][ind])

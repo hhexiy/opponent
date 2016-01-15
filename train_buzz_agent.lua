@@ -130,26 +130,44 @@ function eval_split(split_index, test)
     local group_reward = torch.zeros(game_env.num_player_groups)
     local group_length = torch.zeros(game_env.num_player_groups)
     local group_nepisodes = torch.zeros(game_env.num_player_groups)
+    local gating = (string.find(opt.agent, 'QBO', 1) and (agent.n_experts > 0)) and true or false
+    local group_weights = gating and torch.FloatTensor(game_env.num_player_groups, agent.n_experts):zero() or nil
+    local log = opt.test == 1 and io.open(opt.savefile .. '.log', 'w') or nil
     local eval_time = sys.clock()
 
     local n = game_env.num_buzzes[split_index]
     for i=1,n do
         state, terminal, reward = game_env:new_game(split_index, true)
+        local episode_gating_weights
+        if test and gating then
+            episode_gating_weights = torch.FloatTensor(agent.n_experts):zero()
+        end
         while true do
             local action_index = agent:perceive(reward, state, terminal, true, 0.0)
             if not terminal then
+                if test and gating then
+                    episode_gating_weights:add(agent.gating_weights)
+                end
                 state, terminal, reward = game_env:step(actions[action_index])
                 -- record every reward
                 episode_reward = episode_reward + reward
                 episode_length = episode_length + 1
             else break end
         end
+        local group = game_env.player_group
+        if test and gating then 
+            episode_gating_weights:div(episode_length)
+            group_weights[group]:add(episode_gating_weights)
+        end
         -- group stats
         if game_env.num_player_groups > 1 then
-            local group = game_env.player_group
             group_reward[group] = group_reward[group] + episode_reward
             group_length[group] = group_length[group] + episode_length
             group_nepisodes[group] = group_nepisodes[group] + 1
+        end
+        -- write log
+        if log ~= nil then
+            log:write(string.format('%d,%d,%d,%.2f\n', game_env.qid, game_env.player_id, group, episode_reward)) 
         end
         -- overall stats
         total_reward = total_reward + episode_reward
@@ -158,6 +176,7 @@ function eval_split(split_index, test)
         episode_length = 0
         nepisodes = nepisodes + 1
     end
+    assert(nepisodes == n)
     eval_time = sys.clock() - eval_time
     total_reward = total_reward / nepisodes
     total_length = total_length / nepisodes
@@ -165,8 +184,12 @@ function eval_split(split_index, test)
         for g=1,game_env.num_player_groups do
             group_reward[g] = group_reward[g] / group_nepisodes[g]
             group_length[g] = group_length[g] / group_nepisodes[g]
+            if group_weights ~= nil then
+                group_weights[g]:div(group_nepisodes[g])
+            end
         end
     end
+    if log ~= nil then io.close(log) end
 
     if not test then 
         start_time = start_time + eval_time
@@ -215,6 +238,12 @@ function eval_split(split_index, test)
                 print(string.format(
                     'reward: %.2f, episode length: %.2f,  num. ep.: %d',
                     group_reward[g], group_length[g], group_nepisodes[g]))
+                if group_weights ~= nil then
+                    for e=1,agent.n_experts do
+                        io.write(string.format('%.4f ', group_weights[g][e]))
+                    end
+                    print('')
+                end
                 game_env:report_error_analysis(g)
             end
         end

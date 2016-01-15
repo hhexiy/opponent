@@ -72,6 +72,10 @@ function nql:__init(args)
             if self.best and exp.best_model then
                 print('Loading saved best Agent Network from ' .. self.network)
                 self.network = exp.best_model
+                -- the gater's softmax layer
+                --print(self.network)
+                --print(self.network.modules[4].modules[4])
+                --os.exit()
             else
                 print('Loading saved Agent Network from ' .. self.network)
                 self.network = exp.model
@@ -429,6 +433,7 @@ function nql:createNetwork()
     return mlp
 end
 
+-- include hidden state from content model
 function nql:createNetwork2()
     local n_hid = 128
     local parallel = nn.ParallelTable()
@@ -447,8 +452,8 @@ function nql:createNetwork2()
 end
 
 function nql:state_to_input(state)
-    --return state
-    return state:narrow(2, self.feat_groups.pred.offset, self.feat_groups.pred.size)
+    return state
+    --return state:narrow(2, self.feat_groups.pred.offset, self.feat_groups.pred.size)
     --return {state:narrow(2, self.feat_groups.pred.offset, self.feat_groups.pred.size),
     --        state:narrow(2, self.feat_groups.state.offset, self.feat_groups.state.size)
     --    }

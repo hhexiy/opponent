@@ -36,8 +36,9 @@ eps_endt=500000
 lr=0.0005
 replay_memory=100000
 batch_size=64
+nexperts=3
 
-agent_params="lr="$(lr)",ep="$(eps)",ep_end="$(eps_end)",ep_endt="$(eps_endt)",discount="$(discount)",learn_start="$(learn_start)",update_freq="$(update_freq)",minibatch_size=$(batch_size),rescale_r=1,bufferSize=512,valid_size=500,target_q=10000,clip_delta=1,replay_memory=$(replay_memory)"
+agent_params="lr="$(lr)",ep="$(eps)",ep_end="$(eps_end)",ep_endt="$(eps_endt)",discount="$(discount)",learn_start="$(learn_start)",update_freq="$(update_freq)",minibatch_size=$(batch_size),rescale_r=1,bufferSize=512,valid_size=500,target_q=10000,clip_delta=1,replay_memory=$(replay_memory),n_experts=$(nexperts)"
 
 network=""
 data_dir=dat/protobowl
