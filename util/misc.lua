@@ -1,6 +1,14 @@
 
 -- misc utilities
 
+function string.starts(String,Start)
+   return string.sub(String,1,string.len(Start))==Start
+end
+
+function string.ends(String,End)
+   return End=='' or string.sub(String,-string.len(End))==End
+end
+
 function clone_list(tensor_list, zero_too)
     -- utility function. todo: move away to some utils file?
     -- takes a list of tensors and returns a list of cloned tensors

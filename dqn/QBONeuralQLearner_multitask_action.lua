@@ -1,11 +1,17 @@
 local nql = torch.class('dqn.QBONeuralQLearner_multitask_action', 'dqn.QBNeuralQLearner')
 
 function nql:__init(args)
-    self.n_experts = args.n_experts
-    print('number of experts: ', self.n_experts)
     self.criterion = nn.MSECriterion() 
     self.num_classes = 1
     self.gating_weights = nil
+    if args.model == 'fc2' then
+        self.createNetwork = self.createNetwork_fc2
+        self.n_experts = 0
+    else
+        self.createNetwork = self.createNetwork_moe
+        self.n_experts = args.n_experts
+    end
+    print('number of experts: ', self.n_experts)
     dqn.QBNeuralQLearner.__init(self, args)
     --print(self.network)
     --os.exit()
@@ -275,7 +281,7 @@ function nql:split_output(outputs)
 end
 
 -- share multitask hid state
-function nql:createNetwork()
+function nql:createNetwork_moe()
     local n_hid = 128
 
     local network = nn.Sequential()
@@ -292,9 +298,10 @@ function nql:createNetwork()
     --mlp_state:add(nn.Linear(self.feat_groups.pred.size+self.feat_groups.opponent.size, n_hid))
     mlp_state:add(nn.Linear(self.feat_groups.pred.size, n_hid))
     mlp_state:add(nn.Rectifier())
-    --mlp_state:add(nn.Linear(n_hid, n_hid))
-    --mlp_state:add(nn.Rectifier())
+    mlp_state:add(nn.Linear(n_hid, n_hid))
+    mlp_state:add(nn.Rectifier())
     mlp:add(mlp_state)
+
     -- multiple experts
     local experts = nn.ConcatTable()
     local n_experts = self.n_experts

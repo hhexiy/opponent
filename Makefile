@@ -1,6 +1,7 @@
 SHELL=/bin/bash
 
-.SECONDORY:
+.PHONY:
+.SECONDARY:
 
 #================= preprocess ===================
 dat/glove/glove.840B.300d.txt:
@@ -25,6 +26,26 @@ dat/qb/buzz_data.txt: dat/qb1/buzzes.csv dat/qb/naqt_questions.csv
 dat/qb/content_data.txt: dat/qb/buzz_data.txt
 #================================================
 
+#================== plots =======================
+acc_pos_scatter.pdf:
+	python scripts/get_player_stats.py dat/qb-all/buzzes.csv
+
+content_acc.log:
+	th train_content.lua -data_dir dat/qb-all -input_file buzz_data.txt -test 1 -init_from content_gru_all.t7
+
+QB%.eval_rewards: QB%
+	th scripts/write_epoch_rewards.lua $< qb
+Soccer%.eval_rewards: Soccer%
+	th scripts/write_epoch_rewards.lua $< soccer
+%.test_rewards: %.eval_rewards
+qb_all_%_rewards.pdf: QBNeuralQLearner_supervised.t7.%_rewards QBNeuralQLearner.t7.%_rewards QBONeuralQLearner_e3.t7.%_rewards QBONeuralQLearner_fc2.t7.%_rewards
+	python scripts/plot_epoch_rewards.py $@ $(word 3,$^) DRON-MoE $(word 4,$^) DRON-concat $(word 1,$^) DQN-self $(word 2,$^) DQN-world 
+soccer_all_%_rewards.pdf: SoccerQ-H2.t7.%_rewards SoccerQO-H2_h20.t7.%_rewards SoccerQO-H2_h50.t7.%_rewards 
+	python scripts/plot_epoch_rewards.py $@ $(word 1,$^) DQN $(word 2,$^) DRON-concat-20 $(word 3,$^) DQN-concat-50
+
+#QBONeuralQLearner_e3_ma.t7.%_rewards QBONeuralQLearner_e3_mg.t7.%_rewards
+#================================================
+
 #================= run_cpu ===================
 agent="QBNeuralQLearner"
 update_freq=4
@@ -37,8 +58,9 @@ lr=0.0005
 replay_memory=100000
 batch_size=64
 nexperts=3
+model=concat
 
-agent_params="lr="$(lr)",ep="$(eps)",ep_end="$(eps_end)",ep_endt="$(eps_endt)",discount="$(discount)",learn_start="$(learn_start)",update_freq="$(update_freq)",minibatch_size=$(batch_size),rescale_r=1,bufferSize=512,valid_size=500,target_q=10000,clip_delta=1,replay_memory=$(replay_memory),n_experts=$(nexperts)"
+agent_params="lr="$(lr)",ep="$(eps)",ep_end="$(eps_end)",ep_endt="$(eps_endt)",discount="$(discount)",learn_start="$(learn_start)",update_freq="$(update_freq)",minibatch_size=$(batch_size),rescale_r=1,bufferSize=512,valid_size=500,target_q=10000,clip_delta=1,replay_memory=$(replay_memory),n_experts=$(nexperts),model='$(model)'"
 
 network=""
 data_dir=dat/protobowl
@@ -57,8 +79,18 @@ savefile=""
 
 args="-data_dir $(data_dir) -input_file $(input_file) -batch_size $(batch_size) -init_content $(content_model) -agent $(agent) -agent_params $(agent_params) -max_epochs $(max_epochs) -hist_len $(hist_len) -eval_freq $(eval_freq) -prog_freq $(prog_freq) -gpuid $(gpu) -threads $(num_threads) -simulate $(simulate) -test $(test)"
 
-run:  
+run_qb:  
 	th train_buzz_agent.lua -data_dir $(data_dir) -input_file $(input_file) -batch_size $(batch_size) -init_content $(content_model) -agent $(agent) -agent_params $(agent_params) -max_epochs $(max_epochs) -hist_len $(hist_len) -eval_freq $(eval_freq) -prog_freq $(prog_freq) -gpuid $(gpu) -threads $(num_threads) -simulate $(simulate) -test $(test) -network $(network) -best -supervise $(supervise) -savefile $(savefile)
+
+opponent=RandomAgent
+games=5000
+eval_games=5000
+height=6
+width=9
+defend=0.5
+seed=1
+run_soccer:  
+	th train_soccer_agent.lua -agent $(agent) -agent_params $(agent_params) -opponent $(opponent) -games $(games) -eval_games $(eval_games) -hist_len $(hist_len) -eval_freq $(eval_freq) -prog_freq $(prog_freq) -gpuid $(gpu) -threads $(num_threads) -test $(test) -network $(network) -best -savefile $(savefile) -height $(height) -width $(width) -defend $(defend) -seed $(seed)
 #=============================================
 
 #================= rnn buzzer ===================

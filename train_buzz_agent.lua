@@ -26,13 +26,6 @@ cmd:option('-framework', '', 'name of training framework')
 cmd:option('-env', '', 'name of environment to use')
 cmd:option('-simulate', 0, 'simulate players or not')
 cmd:option('-supervise', 0, 'using supervised signal as reward during training')
-cmd:option('-game_path', '', 'path to environment file (ROM)')
-cmd:option('-env_params', '', 'string of environment parameters')
-cmd:option('-pool_frms', '',
-           'string of frame pooling parameters (e.g.: size=2,type="max")')
-cmd:option('-actrep', 1, 'how many times to repeat action')
-cmd:option('-random_starts', 0, 'play action 0 between 1 and random_starts ' ..
-           'number of times at the start of each training episode')
 cmd:option('-checkpoint_dir', '/fs/clip-scratch/hhe/opponent/cv', 'output directory where checkpoints get written')
 cmd:option('-savefile','','filename to autosave the checkpont to. Will be inside checkpoint_dir/')
 cmd:option('-network', '', 'reload pretrained network')
@@ -66,7 +59,7 @@ opt.supervise = opt.supervise == 1 and true or false
 --- General env setup based on opt
 require 'setup'
 env_setup()
-local agent, game_env = dqn_setup()
+local agent, game_env = qb_dqn_setup()
 local actions = agent.actions
 
 function test_framework()
@@ -167,7 +160,7 @@ function eval_split(split_index, test)
         end
         -- write log
         if log ~= nil then
-            log:write(string.format('%d,%d,%d,%.2f\n', game_env.qid, game_env.player_id, group, episode_reward)) 
+            log:write(string.format('%d,%d,%d,%.2f,%d\n', game_env.qid, game_env.player_id, group, episode_reward, episode_length)) 
         end
         -- overall stats
         total_reward = total_reward + episode_reward
@@ -214,23 +207,21 @@ function eval_split(split_index, test)
 
         local time_dif = time_history[ind+1] - time_history[ind]
 
-        local training_rate = opt.actrep*opt.eval_freq/time_dif
-
         print(string.format(
             'epsilon: %.2f, lr: %G\n' ..
             'reward: %.2f, episode length: %.2f\n' ..
-            'training time: %ds, training rate: %dfps, eval time: %ds, ' ..
-            'eval rate: %dfps,  num. ep.: %d',
+            'training time: %ds, eval time: %ds, ' ..
+            'num. ep.: %d',
             agent.ep, agent.lr, total_reward, total_length, time_dif,
-            training_rate, eval_time, opt.actrep*opt.eval_steps/eval_time,
+            eval_time, 
             n))
         game_env:report_error_analysis()
     else
         print(string.format(
             '\nreward: %.2f, episode length: %.2f, epsilon: %.2f, ' ..
-            'eval time: %ds, eval rate: %dfps,  num. ep.: %d',
+            'eval time: %ds, num. ep.: %d',
             total_reward, total_length, agent.ep, 
-            eval_time, opt.actrep*opt.eval_steps/eval_time, n))
+            eval_time, n))
         game_env:report_error_analysis()
         if game_env.num_player_groups > 1 then
             for g=1,game_env.num_player_groups do
@@ -248,6 +239,7 @@ function eval_split(split_index, test)
             end
         end
         -- record eval reward history
+        -- TODO: remove split_index
         if eval_reward_history[split_index] == nil then
             eval_reward_history[split_index] = {}
         end

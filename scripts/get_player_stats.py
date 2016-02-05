@@ -2,7 +2,12 @@ import sys, csv
 from collections import defaultdict
 import matplotlib
 matplotlib.use('PDF')
+text_size = 20
+matplotlib.rcParams['xtick.labelsize'] = text_size
+matplotlib.rcParams['ytick.labelsize'] = text_size
+matplotlib.rcParams['axes.labelsize'] = text_size
 import matplotlib.pyplot as plt
+import numpy as np
 
 if __name__ == '__main__':
     buzz_file = sys.argv[1]
@@ -31,7 +36,7 @@ if __name__ == '__main__':
             users[user_id]['questions'].add(qid)
 
     sorted_users = sorted(users.items(), key=lambda x: x[1]['total'], reverse=True)
-    cutoff = 100
+    cutoff = 200
     sorted_users = filter(lambda x: x[1]['total'] >= cutoff, sorted_users)
     all_answered_questions = [x for user in sorted_users for x in user[1]['questions']]
     answered_questions = set(all_answered_questions)
@@ -55,6 +60,13 @@ if __name__ == '__main__':
     # scatter plot
     acc = [u[1]['correct'] for u in sorted_users]
     pos = [u[1]['position'] for u in sorted_users]
-    s = [4*2**(u[1]['total']/total*100) for u in sorted_users]
-    plt.scatter(pos, acc, s=s)
-    plt.savefig('acc_pos_scatter.pdf')
+    s = [(10*u[1]['total']/total*100)**2 for u in sorted_users]
+    num_answered = np.array([u[1]['total'] for u in sorted_users])
+    fig, ax = plt.subplots()
+    cs = ax.scatter(pos, acc, s=s, c=num_answered, cmap=plt.cm.seismic, alpha=0.8)
+    fig.colorbar(cs, ax=ax)
+    ax.set_xlabel('Number of words revealed', fontsize=20)
+    ax.set_ylabel('Accuracy', fontsize=20)
+    ax.grid(True)
+    fig.tight_layout()
+    fig.savefig('acc_pos_scatter.pdf')

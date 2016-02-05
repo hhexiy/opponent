@@ -1,21 +1,13 @@
-local nql = torch.class('dqn.QBONeuralQLearner_multitask_group', 'dqn.QBNeuralQLearner')
+local nql = torch.class('dqn.SoccerNeuralQLearner_multitask', 'dqn.SoccerNeuralQLearner')
 
 function nql:__init(args)
-    self.feat_groups = args.feat_groups
-    self.criterion = nn.ClassNLLCriterion() 
-    self.num_classes = 4
-    if args.model == 'fc2' then
-        self.createNetwork = self.createNetwork_fc2
-        self.n_experts = 0
-    else
-        self.createNetwork = self.createNetwork_moe
-        self.n_experts = args.n_experts
-    end
-    print('number of experts: ', self.n_experts)
-    self.gating_weights = nil
-    dqn.QBNeuralQLearner.__init(self, args)
-    --print(self.network)
-    --os.exit()
+    dqn.SoccerNeuralQLearner.__init(self, args)
+end
+
+function nql:split_output(outputs)
+    return {outputs:narrow(2, 1, self.num_classes),
+            outputs:narrow(2, self.num_classes+1, self.n_actions)
+        }
 end
 
 function nql:greedy(state)
@@ -44,12 +36,12 @@ function nql:greedy(state)
 
     self.lastAction = besta[r]
 
-    if self.n_experts > 0 then
-        -- share
-        self.gating_weights = self.network.modules[2].modules[1].modules[3].modules[2].modules[2].output
-        -- gating weights as output
-        --self.gating_weights = self.network.modules[2].modules[1].modules[4].output
-    end
+    --if self.n_experts > 0 then
+    --    -- share
+    --    self.gating_weights = self.network.modules[2].modules[1].modules[3].modules[2].modules[2].output
+    --    -- gating weights as output
+    --    --self.gating_weights = self.network.modules[2].modules[1].modules[4].output
+    --end
     return besta[r]
 end
 
@@ -183,31 +175,22 @@ function nql:qLearnMinibatch()
 end
 
 
--- TODO: fix state features: add to default using parallel
 function nql:state_to_input(state)
-    return 
-        --state:narrow(2, 1, self.feat_groups.opponent.size+self.feat_groups.pred.size),
-        {
+    return {
             state:narrow(2, self.feat_groups.opponent.offset, self.feat_groups.opponent.size):clone(),
-            state:narrow(2, self.feat_groups.pred.offset, self.feat_groups.pred.size)
+            state:narrow(2, self.feat_groups.state.offset, self.feat_groups.state.size)
         },
-        state:narrow(2, self.feat_groups.opp_group.offset, self.feat_groups.opp_group.size)
-end
-
-function nql:split_output(outputs)
-    return {outputs:narrow(2, 1, self.num_classes),
-            outputs:narrow(2, self.num_classes+1, self.n_actions)
-        }
+        state:narrow(2, self.feat_groups.supervision.offset, self.feat_groups.supervision.size)
 end
 
 -- fully connected 2 parts
 function nql:createNetwork_fc2()
-    local n_hid = 128
-    local n_hid_opp = 10
+    local n_hid = 50
+    local n_hid_opp = 50 
     local mlp = nn.Sequential()
     local parallel = nn.ParallelTable()
     parallel:add(nn.Sequential():add(nn.Linear(self.feat_groups.opponent.size, n_hid_opp)):add(nn.Rectifier()))
-    parallel:add(nn.Sequential():add(nn.Linear(self.feat_groups.pred.size, n_hid)):add(nn.Rectifier()))
+    parallel:add(nn.Sequential():add(nn.Linear(self.feat_groups.state.size, n_hid)):add(nn.Rectifier()))
     mlp:add(parallel)
     local multitask = nn.ConcatTable()
     multitask:add(nn.Sequential():add(nn.SelectTable(1)):add(nn.Linear(n_hid_opp, self.num_classes)):add(nn.LogSoftMax()))
@@ -218,69 +201,9 @@ function nql:createNetwork_fc2()
     return mlp
 end
 
--- concat multitask hidden state
-function nql:createNetwork2()
-    local n_hid = 128
 
-    local network = nn.Sequential()
-    -- {opponent}, {state}
-    local split_inputs = nn.ConcatTable():add(nn.JoinTable(2)):add(nn.JoinTable(2)):add(nn.SelectTable(2))
-    -- {opponent + state}, {opponent + state}, {state}
-    network:add(split_inputs)
-    local parallel = nn.ParallelTable()
-
-    -- state to predict q-values
-    local mlp = nn.Sequential()
-    local mlp_state = nn.Sequential()
-    mlp_state:add(nn.Linear(self.feat_groups.pred.size, n_hid))
-    mlp_state:add(nn.Rectifier())
-    --mlp_state:add(nn.Linear(n_hid, n_hid))
-    --mlp_state:add(nn.Rectifier())
-    mlp:add(mlp_state)
-    -- multiple experts
-    local experts = nn.ConcatTable()
-    local n_experts = self.n_experts
-    for i = 1,n_experts do
-       local expert = nn.Sequential()
-       expert:add(nn.Linear(n_hid, self.n_actions))
-       experts:add(expert)
-    end
-    mlp:add(experts)
-
-    local multitask = nn.Sequential()
-    -- opponent model
-    local opponent = nn.Sequential()
-    opponent:add(nn.Linear(self.feat_groups.pred.size+self.feat_groups.opponent.size, n_hid))
-    opponent:add(nn.Rectifier())
-    multitask:add(opponent)
-    multitask:add(nn.ConcatTable():add(nn.Sequential():add(nn.Linear(n_hid, self.num_classes)):add(nn.LogSoftMax())):add(nn.Identity()))
-    -- {opp pred}, {hid}
-
-    parallel:add(multitask):add(nn.Sequential():add(nn.Linear(self.feat_groups.pred.size+self.feat_groups.opponent.size, n_hid)):add(nn.Rectifier())):add(mlp)
-    network:add(parallel):add(nn.FlattenTable())
-    -- {{opp pred}, {hid1}}, {hid2}, {{experts1} ... {expertsn}}
-
-    local outputs = nn.ConcatTable()
-    -- opp pred
-    outputs:add(nn.SelectTable(1))
-    outputs:add(nn.Sequential():add(nn.NarrowTable(2, 2)):add(nn.JoinTable(2)):add(nn.Linear(n_hid*2, n_experts)):add(nn.SoftMax()))
-    outputs:add(nn.NarrowTable(4, n_experts))
-    network:add(outputs)
-    -- {opp pred}, {gater}, {experts}
-
-    local results = nn.ConcatTable()
-    results:add(nn.SelectTable(1))
-    results:add(nn.Sequential():add(nn.NarrowTable(2, 2)):add(nn.MixtureTable()))
-    -- two tables: {opp pred}, {q values}
-    network:add(results):add(nn.JoinTable(2))
-
-    return network
-end
-
--- share multitask part
 function nql:createNetwork_moe()
-    local n_hid = 128
-
+    local n_hid = 50
     local network = nn.Sequential()
     -- {opponent}, {state}
     local split_inputs = nn.ConcatTable():add(nn.JoinTable(2)):add(nn.SelectTable(2))
@@ -291,7 +214,7 @@ function nql:createNetwork_moe()
     -- state to predict q-values
     local mlp = nn.Sequential()
     local mlp_state = nn.Sequential()
-    mlp_state:add(nn.Linear(self.feat_groups.pred.size, n_hid))
+    mlp_state:add(nn.Linear(self.feat_groups.state.size, n_hid))
     mlp_state:add(nn.Rectifier())
     mlp_state:add(nn.Linear(n_hid, n_hid))
     mlp_state:add(nn.Rectifier())
@@ -308,7 +231,7 @@ function nql:createNetwork_moe()
 
     -- multitask: 1. get mixture weights from input; 2. opponent prediction
     local multitask = nn.Sequential()
-    multitask:add(nn.Linear(self.feat_groups.pred.size+self.feat_groups.opponent.size, n_hid))
+    multitask:add(nn.Linear(self.feat_groups.state.size+self.feat_groups.opponent.size, n_hid))
     multitask:add(nn.Rectifier())
     local concat = nn.ConcatTable() 
     -- opponent prediction
@@ -336,69 +259,5 @@ function nql:createNetwork_moe()
     network:add(parallel_outputs):add(nn.JoinTable(2))
 
     return network
-end
-
--- use gating weights as outputs
-function nql:createNetwork_weights()
-    local n_hid = 128
-
-    local network = nn.Sequential()
-    -- {opponent}, {state}
-    local split_inputs = nn.ConcatTable():add(nn.JoinTable(2)):add(nn.SelectTable(2))
-    -- {opponent + state}, {state}
-    network:add(split_inputs)
-    local parallel = nn.ParallelTable()
-
-    -- state to predict q-values
-    local mlp = nn.Sequential()
-    local mlp_state = nn.Sequential()
-    mlp_state:add(nn.Linear(self.feat_groups.pred.size, n_hid))
-    mlp_state:add(nn.Rectifier())
-    mlp_state:add(nn.Linear(n_hid, n_hid))
-    mlp_state:add(nn.Rectifier())
-
-    mlp:add(mlp_state)
-    -- multiple experts
-    local experts = nn.ConcatTable()
-    local n_experts = self.num_classes
-    for i = 1,n_experts do
-       local expert = nn.Sequential()
-       expert:add(nn.Linear(n_hid, self.n_actions))
-       experts:add(expert)
-    end
-    mlp:add(experts)
-
-    local gater = nn.Sequential()
-    gater:add(nn.Linear(self.feat_groups.pred.size+self.feat_groups.opponent.size, n_hid))
-    gater:add(nn.Rectifier())
-    gater:add(nn.Linear(n_hid, n_experts))
-    gater:add(nn.SoftMax())
-
-    parallel:add(gater):add(mlp)
-    network:add(parallel)
-    local outputs = nn.ConcatTable()
-    -- gating weights
-    outputs:add(nn.SelectTable(1))
-    outputs:add(nn.MixtureTable())
-    -- two tables: {opp pred}, {q values}
-    network:add(outputs):add(nn.JoinTable(2))
-
-    return network
-end
-
--- fully connected
-function nql:createNetwork_fc()
-    local n_hid = 128
-    local mlp = nn.Sequential()
-    mlp:add(nn.Linear(self.feat_groups.pred.size+self.feat_groups.opponent.size, n_hid))
-    mlp:add(nn.Rectifier())
-    mlp:add(nn.Linear(n_hid, n_hid))
-    mlp:add(nn.Rectifier())
-    local multitask = nn.ConcatTable()
-    multitask:add(nn.Sequential():add(nn.Linear(n_hid, self.num_classes)):add(nn.LogSoftMax()))
-    multitask:add(nn.Linear(n_hid, self.n_actions))
-    mlp:add(multitask)
-    mlp:add(nn.JoinTable(2))
-    return mlp
 end
 

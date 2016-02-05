@@ -1,10 +1,8 @@
-local nql = torch.class('dqn.QBNeuralQLearner')
+local nql = torch.class('dqn.SoccerNeuralQLearner')
 
 
 function nql:__init(args)
     self.state_dim  = args.state_dim -- State dimensionality.
-    self.feat_groups = args.feat_groups
-    self.ans_size = args.ans_size
     self.actions    = args.actions
     self.n_actions  = #self.actions
     self.verbose    = args.verbose
@@ -53,7 +51,6 @@ function nql:__init(args)
 
     self.transition_params = args.transition_params or {}
 
-
     -- check whether there is a network file
     if args.network ~= nil then
         self.network = args.network
@@ -72,10 +69,6 @@ function nql:__init(args)
             if self.best and exp.best_model then
                 print('Loading saved best Agent Network from ' .. self.network)
                 self.network = exp.best_model
-                -- the gater's softmax layer
-                --print(self.network)
-                --print(self.network.modules[4].modules[4])
-                --os.exit()
             else
                 print('Loading saved Agent Network from ' .. self.network)
                 self.network = exp.model
@@ -172,6 +165,7 @@ function nql:preprocess(rawstate)
     return rawstate
 end
 
+
 function nql:getQUpdate(args)
     local s, a, r, s2, term, delta
     local q, q2, q2_max
@@ -238,7 +232,6 @@ function nql:qLearnMinibatch()
     assert(self.transitions:size() > self.minibatch_size)
 
     local s, a, r, s2, term = self.transitions:sample(self.minibatch_size)
-    --print(s:narrow(2, 1, 10), a[1], r[1], s2:narrow(2, 1, 10), term[1])
 
     local targets, delta, q2_max = self:getQUpdate{s=s, a=a, r=r, s2=s2,
         term=term, update_qmax=true}
@@ -249,9 +242,6 @@ function nql:qLearnMinibatch()
     -- get new gradient
     s = self:state_to_input(s)
     self.network:backward(s, targets)
-
-    -- clip gradients 
-    --self.dw:clamp(-5, 5)
 
     -- add weight cost to gradient
     self.dw:add(-self.wc, self.w)
@@ -271,13 +261,6 @@ function nql:qLearnMinibatch()
     self.tmp:add(self.g2)
     self.tmp:add(0.01)
     self.tmp:sqrt()
-
-    --rmsprop
-    --local smoothing_value = 1e-8
-    --self.tmp:cmul(self.dw, self.dw)
-    --self.g:mul(0.9):add(0.1, self.tmp)
-    --self.tmp = torch.sqrt(self.g)
-    --self.tmp:add(smoothing_value)  --negative learning rate
 
     -- accumulate update
     self.deltas:mul(0):addcdiv(self.lr, self.dw, self.tmp)
@@ -304,7 +287,7 @@ function nql:compute_validation_statistics()
 end
 
 
-function nql:perceive(reward, rawstate, terminal, testing, testing_ep, priority)
+function nql:perceive(reward, rawstate, terminal, testing, testing_ep)
     -- Preprocess state (will be set to nil if terminal)
     local state = self:preprocess(rawstate):float()
     local curState
@@ -316,7 +299,7 @@ function nql:perceive(reward, rawstate, terminal, testing, testing_ep, priority)
         reward = math.max(reward, self.min_reward)
     end
     if self.rescale_r then
-        self.r_max = math.max(self.r_max, math.abs(reward))
+        self.r_max = math.max(self.r_max, reward)
     end
 
     self.transitions:add_recent_state(state, terminal)
@@ -325,8 +308,6 @@ function nql:perceive(reward, rawstate, terminal, testing, testing_ep, priority)
 
     --Store transition s, a, r, s'
     if self.lastState and not testing then
-        --print('add transition:')
-        --print(self.lastState[self.state_dim], self.lastAction, reward, self.lastTerminal)
         self.transitions:add(self.lastState, self.lastAction, reward,
                              self.lastTerminal, priority)
     end
@@ -390,7 +371,7 @@ function nql:greedy(state)
     if self.gpu >= 0 then
         state = state:cuda()
     end
-   
+
     local s = self:state_to_input(state)
     local q = self.network:forward(s):float():squeeze()
     local maxq = q[1]
@@ -414,43 +395,20 @@ function nql:greedy(state)
     return besta[r]
 end
 
--- fully connected
+function nql:state_to_input(state)
+    return state
+end
+
 function nql:createNetwork()
-    local n_hid = 128
+    local n_hid = 50
     local mlp = nn.Sequential()
-    mlp:add(nn.Linear(self.feat_groups.pred.size, n_hid))
+    mlp:add(nn.Linear(self.hist_len*self.state_dim, n_hid))
     mlp:add(nn.Rectifier())
     mlp:add(nn.Linear(n_hid, n_hid))
     mlp:add(nn.Rectifier())
     mlp:add(nn.Linear(n_hid, self.n_actions))
 
     return mlp
-end
-
--- include hidden state from content model
-function nql:createNetwork2()
-    local n_hid = 128
-    local parallel = nn.ParallelTable()
-    local mlp = nn.Sequential()
-    local mlp_pred = nn.Sequential()
-    mlp_pred:add(nn.Linear(self.feat_groups.pred.size, n_hid))
-    mlp_pred:add(nn.Rectifier())
-    parallel:add(mlp_pred)
-    parallel:add(nn.Identity())
-    mlp:add(parallel)
-    mlp:add(nn.JoinTable(2))
-    mlp:add(nn.Linear(n_hid+self.feat_groups.state.size, n_hid))
-    mlp:add(nn.Rectifier())
-    mlp:add(nn.Linear(n_hid, self.n_actions))
-    return mlp
-end
-
-function nql:state_to_input(state)
-    return state
-    --return state:narrow(2, self.feat_groups.pred.offset, self.feat_groups.pred.size)
-    --return {state:narrow(2, self.feat_groups.pred.offset, self.feat_groups.pred.size),
-    --        state:narrow(2, self.feat_groups.state.offset, self.feat_groups.state.size)
-    --    }
 end
 
 

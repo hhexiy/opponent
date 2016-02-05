@@ -11,13 +11,19 @@ end
 function eval.all_accuracy(pred, gold, mask)
     assert(pred:isSameSizeAs(gold) and gold:isSize(mask:size()), 'dimension mismatch')
     local acc = torch.zeros(pred:size(2)) 
+    local acc_log = io.open('content_acc.log', 'w') 
     for t=1,pred:size(2) do
         local correct = pred:select(2, t):maskedSelect(mask:select(2, t)):eq(gold:select(2, t):maskedSelect(mask:select(2, t)))
         if correct:dim() > 0 then
+            for p=1,correct:size(1) do
+                acc_log:write(string.format('%d ', correct[p]))
+            end
+            acc_log:write('\n')
             acc[t] = correct:sum() / correct:size(1)
         end
     end
     torch.save('all_acc.t7', acc)
+    acc_log:close()
 end
 
 function eval.seq_accuracy(pred, gold, mask)

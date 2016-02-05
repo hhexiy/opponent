@@ -6,7 +6,13 @@ function nql:__init(args)
     if self.use_words then
         self.word_embedding = qb.word_embedding  
     end
-    self.n_experts = args.n_experts
+    if args.model == 'fc2' then
+        self.n_experts = 0
+        self.createNetwork = self.createNetwork_fc2
+    else
+        self.n_experts = args.n_experts
+        self.createNetwork = self.createNetwork_moe
+    end
     print('number of experts: ', self.n_experts)
     dqn.QBNeuralQLearner.__init(self, args)
     self.gating_weights = nil
@@ -89,15 +95,15 @@ function nql:createNetwork_fc()
 end
 
 -- add state to opp
-function nql:createNetwork()
+function nql:createNetwork_moe()
     local n_hid = 128
     local mlp = nn.Sequential()
 
     local mlp_default = nn.Sequential()
     mlp_default:add(nn.Linear(self.feat_groups.pred.size, n_hid))
     mlp_default:add(nn.Rectifier())
-    --mlp_default:add(nn.Linear(n_hid, n_hid))
-    --mlp_default:add(nn.Rectifier())
+    mlp_default:add(nn.Linear(n_hid, n_hid))
+    mlp_default:add(nn.Rectifier())
 
     mlp:add(mlp_default)
 
