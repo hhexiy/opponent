@@ -27,21 +27,32 @@ dat/qb/content_data.txt: dat/qb/buzz_data.txt
 #================================================
 
 #================== plots =======================
-acc_pos_scatter.pdf:
+figures/acc_pos_scatter.pdf: scripts/get_player_stats.py dat/qb-all/buzzes.csv
 	python scripts/get_player_stats.py dat/qb-all/buzzes.csv
 
-content_acc.log:
+results/content_acc.log: content_gru_all.t7
 	th train_content.lua -data_dir dat/qb-all -input_file buzz_data.txt -test 1 -init_from content_gru_all.t7
+
+figures/content_acc.pdf: scripts/plot_content_model_acc.py results/content_acc.log
+	python scripts/plot_content_model_acc.py results/content_acc.log 
 
 QB%.eval_rewards: QB%
 	th scripts/write_epoch_rewards.lua $< qb
 Soccer%.eval_rewards: Soccer%
 	th scripts/write_epoch_rewards.lua $< soccer
 %.test_rewards: %.eval_rewards
-qb_all_%_rewards.pdf: QBNeuralQLearner_supervised.t7.%_rewards QBNeuralQLearner.t7.%_rewards QBONeuralQLearner_e3.t7.%_rewards QBONeuralQLearner_fc2.t7.%_rewards
+
+figures/qb_all_%_rewards.pdf: results/QBNeuralQLearner_supervised.t7.%_rewards results/QBNeuralQLearner.t7.%_rewards results/QBONeuralQLearner_e3_2.t7.%_rewards results/QBONeuralQLearner_fc2.t7.%_rewards
 	python scripts/plot_epoch_rewards.py $@ $(word 3,$^) DRON-MoE $(word 4,$^) DRON-concat $(word 1,$^) DQN-self $(word 2,$^) DQN-world 
-soccer_all_%_rewards.pdf: SoccerQ-H2.t7.%_rewards SoccerQO-H2_h20.t7.%_rewards SoccerQO-H2_h50.t7.%_rewards 
-	python scripts/plot_epoch_rewards.py $@ $(word 1,$^) DQN $(word 2,$^) DRON-concat-20 $(word 3,$^) DQN-concat-50
+
+figures/soccer_all_%_rewards.pdf: results/SoccerQ-H-0.5.t7.%_rewards results/SoccerQO-H-0.5_fc2.t7.%_rewards results/SoccerQO-H-0.5_e3.t7.%_rewards scripts/plot_epoch_rewards.py 
+	python scripts/plot_epoch_rewards.py $@ $(word 1,$^) DQN-world $(word 2,$^) DRON-concat $(word 3,$^) DRON-MoE
+
+figures/qb_moe_bar.pdf:
+	python scripts/plot_bar_chart.py $@ qb
+
+figures/soccer_moe_bar.pdf:
+	python scripts/plot_bar_chart.py $@ soccer
 
 #QBONeuralQLearner_e3_ma.t7.%_rewards QBONeuralQLearner_e3_mg.t7.%_rewards
 #================================================
@@ -58,7 +69,7 @@ lr=0.0005
 replay_memory=100000
 batch_size=64
 nexperts=3
-model=concat
+model=concat # or fc2
 
 agent_params="lr="$(lr)",ep="$(eps)",ep_end="$(eps_end)",ep_endt="$(eps_endt)",discount="$(discount)",learn_start="$(learn_start)",update_freq="$(update_freq)",minibatch_size=$(batch_size),rescale_r=1,bufferSize=512,valid_size=500,target_q=10000,clip_delta=1,replay_memory=$(replay_memory),n_experts=$(nexperts),model='$(model)'"
 

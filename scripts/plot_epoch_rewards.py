@@ -1,6 +1,5 @@
 import sys
 import matplotlib
-matplotlib.use('PDF')
 text_size = 20
 matplotlib.rcParams['xtick.labelsize'] = text_size
 matplotlib.rcParams['ytick.labelsize'] = text_size

@@ -1,7 +1,5 @@
 import sys, csv
-from collections import defaultdict
 import matplotlib
-matplotlib.use('PDF')
 text_size = 20
 matplotlib.rcParams['xtick.labelsize'] = text_size
 matplotlib.rcParams['ytick.labelsize'] = text_size
@@ -69,4 +67,4 @@ if __name__ == '__main__':
     ax.set_ylabel('Accuracy', fontsize=20)
     ax.grid(True)
     fig.tight_layout()
-    fig.savefig('acc_pos_scatter.pdf')
+    fig.savefig('figures/acc_pos_scatter.pdf')

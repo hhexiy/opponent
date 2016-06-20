@@ -160,7 +160,7 @@ function eval_split(split_index, test)
         end
         -- write log
         if log ~= nil then
-            log:write(string.format('%d,%d,%d,%.2f,%d\n', game_env.qid, game_env.player_id, group, episode_reward, episode_length)) 
+            log:write(string.format('%d,%d,%d,%d,%.2f\n', game_env.qid, game_env.player_id, group, episode_length, episode_reward)) 
         end
         -- overall stats
         total_reward = total_reward + episode_reward

@@ -1,6 +1,5 @@
 import sys
 import matplotlib
-matplotlib.use('PDF')
 text_size = 20
 matplotlib.rcParams['xtick.labelsize'] = text_size
 matplotlib.rcParams['ytick.labelsize'] = text_size
@@ -32,11 +31,12 @@ if __name__ == '__main__':
     fig, ax = plt.subplots()
     ax.set_xlabel('Number of words revealed')
     ax.set_ylabel('Accuracy')
+    #ax.set_xlim([0,120])
     #ax.errorbar(range(len(acc)), [x[0] for x in acc], yerr=[err_lo, err_hi])
     #ax.fill_between(x, y-err_lo, y+err_hi, alpha=0.5, interpolate=True)
     ax.plot(x, y, linewidth=2)
-    ax.plot(x, y-err_lo, 'g--', label='95% confidence interval')
+    ax.plot(x, y-err_lo, 'g--', label='95\% confidence interval')
     ax.plot(x, y+err_hi, 'g--')
     ax.legend(loc='lower right', fontsize=text_size)
     plt.tight_layout()
-    fig.savefig('content_acc.pdf')
+    fig.savefig('figures/content_acc.pdf')
