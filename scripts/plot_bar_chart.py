@@ -1,6 +1,5 @@
 import sys
 import matplotlib
-matplotlib.use('PDF')
 text_size = 20
 matplotlib.rcParams['xtick.labelsize'] = text_size
 matplotlib.rcParams['ytick.labelsize'] = text_size
@@ -42,6 +41,7 @@ if __name__ == '__main__':
     models = {'DQN':defaultdict(list), 'R':defaultdict(list), 'R+action':defaultdict(list), 'R+group':defaultdict(list)}
     N = len(models)
 
+    reward_id = -2 if game == 'qb' else -1
     get_stats(baseline, models['DQN'])
     for k in models['DQN']:
         models['DQN'][k] = models['DQN'][k]*3

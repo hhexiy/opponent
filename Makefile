@@ -54,7 +54,11 @@ figures/qb_moe_bar.pdf:
 figures/soccer_moe_bar.pdf:
 	python scripts/plot_bar_chart.py $@ soccer
 
-#QBONeuralQLearner_e3_ma.t7.%_rewards QBONeuralQLearner_e3_mg.t7.%_rewards
+#================================================
+
+#================= content model ================
+train_content:
+	th train_content.lua -data_dir dat/qb-all -input_file content_data.txt -batch_size 64
 #================================================
 
 #================= run_cpu ===================
@@ -76,7 +80,7 @@ agent_params="lr="$(lr)",ep="$(eps)",ep_end="$(eps_end)",ep_endt="$(eps_endt)",d
 network=""
 data_dir=dat/protobowl
 input_file="buzz_data.txt"
-content_model=content_gru_epoch20.00_3.8778.t7
+content_model=content_gru_all.t7
 test=0
 max_epochs=50
 hist_len=2
