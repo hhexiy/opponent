@@ -4,9 +4,6 @@ require 'nngraph'
 require 'optim'
 require 'lfs'
 require 'util.misc'
-require 'model.MultiHot'
-require 'model.OneHot'
-require 'model.MaskedLookupTable'
 include('model/RNNModel.lua')
 
 function env_setup()
